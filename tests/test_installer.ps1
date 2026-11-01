@@ -115,6 +115,28 @@ try {
     Run @('/silent', '/dir', $game, '/nolayer'); Assert ($code -eq 1) '/nolayer is refused'
     SameAsBase 'after the refused /nolayer'
 
+    # read-only marks: on files already in the game (left by an earlier install or a copy) and on the packaged files themselves
+    Run @('/silent', '/dir', $game, '/textures', 'ru'); Assert ($code -eq 0) 'install before the read-only checks'
+    $roNames = 'Enhanced.Rus', 'Enhanced.u', 'Enhanced.int', 'IpDrv.u', 'Packages.md5'
+    foreach ($nm in $roNames) { (Get-Item "$sys\$nm").Attributes = 'ReadOnly' }
+    foreach ($nm in 'Enhanced.Rus', 'Enhanced.int') { (Get-Item "$w\pkg\files\$nm").Attributes = 'ReadOnly' }
+    Run @('/silent', '/dir', $game, '/textures', 'ru'); Assert ($code -eq 0) 'install over read-only files (the error of the player: access denied on Enhanced.Rus)'
+    Assert (-not ((Get-Item "$sys\Enhanced.Rus").Attributes -band [IO.FileAttributes]::ReadOnly)) 'the installed file is not read-only'
+    # a failed install over read-only files puts the files and their marks back
+    foreach ($nm in $roNames) { (Get-Item "$sys\$nm").Attributes = 'ReadOnly' }
+    $roHash = (Get-FileHash "$sys\Enhanced.Rus").Hash
+    Remove-Item "$sys\d3d8.dll" -Force
+    New-Item -ItemType Directory "$sys\d3d8.dll" | Out-Null
+    Run @('/silent', '/dir', $game, '/textures', 'ru'); Assert ($code -eq 1) 'a failed install over read-only files fails cleanly'
+    Remove-Item "$sys\d3d8.dll" -Force
+    Assert ($text -notmatch 'ROLLBACK FAILED') 'the rollback of read-only files works'
+    Assert (((Get-Item "$sys\Enhanced.Rus").Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) 'the read-only mark is put back by the rollback'
+    Assert ((Get-FileHash "$sys\Enhanced.Rus").Hash -eq $roHash) 'the content is put back by the rollback'
+    Assert (-not (Get-ChildItem $sys -Force | Where-Object Name -like '*.enhanced-tmp-*')) 'no temporary files left'
+    Run @('/silent', '/dir', $game, '/uninstall'); Assert ($code -eq 0) 'removal of read-only files'
+    Remove-Item "$sys\d3d8_real.dll", "$sys\d3d8_real.dll.enhanced-made" -Force -ErrorAction SilentlyContinue
+    SameAsBase 'after the read-only checks'
+
     if ($HdPack) {
         $pack = $HdPack
         New-Item -ItemType Directory "$sys\d3d8.dll" | Out-Null
@@ -126,6 +148,18 @@ try {
         Run @('/silent', '/dir', $game, '/uninstall'); Assert ($code -eq 0) 'removal of the HD install'
         SameAsBase 'after HD install + removal'
     }
+
+    # a running game is refused before anything changes
+    Copy-Item "$env:WINDIR\System32\ping.exe" "$sys\Game.exe" -Force
+    $gp = Start-Process "$sys\Game.exe" -ArgumentList '-t', '127.0.0.1' -WindowStyle Hidden -PassThru
+    Start-Sleep -Milliseconds 800
+    try {
+        Run @('/silent', '/dir', $game, '/textures', 'ru')
+        Assert ($code -eq 1) 'install is refused while the game runs'
+        Assert ($text -match 'game is running|\(Game\.exe') ('the message says the game is running -- got: ' + $text)
+        Assert (-not (Test-Path "$sys\Enhanced.u")) 'nothing was installed while the game ran'
+    }
+    finally { Stop-Process -Id $gp.Id -Force -ErrorAction SilentlyContinue }
 
     $ownerAfter = Get-ChildItem $ownerDocs -Recurse -File | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTime.Ticks)" }
     Assert ((Compare-Object $ownerBefore $ownerAfter | Measure-Object).Count -eq 0) 'owner Documents untouched'

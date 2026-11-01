@@ -331,10 +331,15 @@ class HdPatcher
                         tab.WriteTo(fs);
                     }
                     if (beforeChange != null) beforeChange(file);
-                    if (File.Exists(file)) File.Replace(tmp, file, null);
+                    Installer.ClearReadOnly(tmp);
+                    if (File.Exists(file))
+                    {
+                        Installer.ClearReadOnly(file);
+                        File.Replace(tmp, file, null);
+                    }
                     else File.Move(tmp, file);
                 }
-                finally { if (File.Exists(tmp)) File.Delete(tmp); }
+                finally { Installer.SafeDelete(tmp); }
                 total += blobs.Count;
                 log(Path.GetFileName(file) + ": " + blobs.Count + " textures");
             }

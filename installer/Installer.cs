@@ -3,6 +3,8 @@
 // lines of Game.ini that make the game start in the mod's menu.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Net.NetworkInformation;
@@ -25,6 +27,56 @@ class Installer
     {
         public string Path, Snapshot;
         public bool Existed;
+        public FileAttributes Attr;
+    }
+
+    // A read-only mark on a file (left by a copy from a read-only medium, by an archive tool, or by the game's own copy) makes every replace and
+    // delete fail with "access denied": it is cleared on the file that is about to be replaced and on every temporary file the setup makes.
+    internal static void ClearReadOnly(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return;
+            FileAttributes a = File.GetAttributes(path);
+            if ((a & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, a & ~FileAttributes.ReadOnly);
+        }
+        catch { }
+    }
+
+    internal static void SafeDelete(string path)
+    {
+        if (!File.Exists(path)) return;
+        ClearReadOnly(path);
+        File.Delete(path);
+    }
+
+    // What to tell the player when Windows refuses a file operation.
+    static string Hint(Exception ex)
+    {
+        if (!(ex is UnauthorizedAccessException) && !(ex is IOException)) return "";
+        return CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "ru"
+            ? " Закройте игру, проверьте, что файл не занят и папка не защищена антивирусом (или запустите установщик от имени администратора), и повторите."
+            : " Close the game, make sure the file is not in use and the folder is not protected by an antivirus (or run the setup as administrator), then try again.";
+    }
+
+    // A running game holds its packages open: say so at the start instead of failing halfway.
+    void RequireGameClosed()
+    {
+        string sys = Sys.TrimEnd('\\') + "\\";
+        foreach (Process p in Process.GetProcessesByName("Game"))
+        {
+            try
+            {
+                string f = p.MainModule.FileName;
+                if (f != null && f.StartsWith(sys, StringComparison.OrdinalIgnoreCase))
+                    throw new Exception(CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "ru"
+                        ? "Игра запущена (Game.exe из этой папки). Закройте её и запустите установщик снова. Ничего не изменено."
+                        : "The game is running (Game.exe from this folder). Close it and start the setup again. Nothing was changed.");
+            }
+            catch (System.ComponentModel.Win32Exception) { }
+            catch (InvalidOperationException) { }
+            finally { p.Dispose(); }
+        }
     }
 
     public string GameDir, DocsDir, Files;
@@ -49,15 +101,25 @@ class Installer
         FileChange c = new FileChange();
         c.Path = path;
         c.Existed = File.Exists(path);
+        if (c.Existed) c.Attr = File.GetAttributes(path);
         c.Snapshot = Path.Combine(TxDir, Changes.Count.ToString() + ".bin");
-        if (c.Existed) System.IO.File.Copy(path, c.Snapshot);
+        if (c.Existed)
+        {
+            System.IO.File.Copy(path, c.Snapshot);
+            ClearReadOnly(c.Snapshot);
+        }
         Changes.Add(c);
         Seen.Add(path, true);
     }
 
     static void CommitTemp(string tmp, string path)
     {
-        if (File.Exists(path)) File.Replace(tmp, path, null);
+        ClearReadOnly(tmp);
+        if (File.Exists(path))
+        {
+            ClearReadOnly(path);
+            File.Replace(tmp, path, null);
+        }
         else File.Move(tmp, path);
     }
 
@@ -70,7 +132,7 @@ class Installer
             System.IO.File.Copy(src, tmp, true);
             CommitTemp(tmp, path);
         }
-        finally { if (File.Exists(tmp)) File.Delete(tmp); }
+        finally { SafeDelete(tmp); }
     }
 
     void AtomicWriteAllBytes(string path, byte[] data)
@@ -82,7 +144,7 @@ class Installer
             System.IO.File.WriteAllBytes(tmp, data);
             CommitTemp(tmp, path);
         }
-        finally { if (File.Exists(tmp)) File.Delete(tmp); }
+        finally { SafeDelete(tmp); }
     }
 
     void AtomicWriteAllText(string path, string text) { AtomicWriteAllText(path, text, new UTF8Encoding(false)); }
@@ -96,14 +158,14 @@ class Installer
             System.IO.File.WriteAllText(tmp, text, encoding);
             CommitTemp(tmp, path);
         }
-        finally { if (File.Exists(tmp)) File.Delete(tmp); }
+        finally { SafeDelete(tmp); }
     }
 
     void DeleteFile(string path)
     {
         if (!File.Exists(path)) return;
         BeforeChange(path);
-        File.Delete(path);
+        SafeDelete(path);
     }
 
     void Rollback()
@@ -114,8 +176,12 @@ class Installer
             FileChange c = Changes[i];
             try
             {
-                if (c.Existed) AtomicCopy(c.Snapshot, c.Path);
-                else if (File.Exists(c.Path)) File.Delete(c.Path);
+                if (c.Existed)
+                {
+                    AtomicCopy(c.Snapshot, c.Path);
+                    try { File.SetAttributes(c.Path, c.Attr); } catch { }
+                }
+                else SafeDelete(c.Path);
             }
             catch (Exception ex) { errors.Add(c.Path + ": " + ex.Message); }
         }
@@ -176,6 +242,7 @@ class Installer
     public void Uninstall()
     {
         if (!File.Exists(P("Engine.dll"))) throw new Exception("Engine.dll not found in " + Sys + ". Give the folder that contains the System folder of the game.");
+        RequireGameClosed();
         Restore(P("Engine.dll"), Log, "Engine.dll restored");
         Restore(P("Packages.md5"), Log, "Packages.md5 restored");
         Restore(P("Default.ini"), Log, "Default.ini restored");
@@ -260,7 +327,7 @@ class Installer
                 if (Directory.Exists(tx)) Directory.Delete(tx, true);
             }
             catch (Exception rb) { rollbackError = rb.Message; }
-            throw new Exception("Installation failed: " + ex.Message + (rollbackError == "" ? " All changed files were restored." : " ROLLBACK FAILED: " + rollbackError));
+            throw new Exception("Installation failed: " + ex.Message + Hint(ex) + (rollbackError == "" ? " All changed files were restored." : " ROLLBACK FAILED: " + rollbackError));
         }
     }
 
@@ -269,6 +336,7 @@ class Installer
     {
         if (!File.Exists(P("Engine.dll"))) throw new Exception("Engine.dll not found in " + Sys + ". Give the folder that contains the System folder of the game.");
         if (!Directory.Exists(Files)) throw new Exception("The folder \"files\" is missing next to the setup. Unpack the whole archive first.");
+        RequireGameClosed();
         // the scripts of the mod call functions that only the layer adds (EnhNativeVersion and the others): without it the game stops at the first level start with "Unknown code token"
         if (!layer) throw new Exception("The mod cannot start without the engine layer (d3d8.dll): its scripts call functions the layer adds. Not installing without it.");
         foreach (string f in ModFiles)

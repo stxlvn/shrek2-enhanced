@@ -25,6 +25,11 @@ var float DropLog;
 var GUIComboBox DropCombo;
 var bool bDropRelease;         // tests only: the mouse button pressed by the step 'clickres' is released on the next tick
 var bool bFilling;             // the two repurposed lists are being filled: their change events are not ours
+var float HudHiddenSince;      // since when the HUD has been hidden with nothing to explain it (see HostMenuWatch)
+var bool bHudTested;           // tests only: see EnhHudTest
+var bool bMenuHoldHost;        // the camera is held where the pause menu's page put it (see ShowInGameMenu)
+var Vector HostHoldLoc;
+var Rotator HostHoldRot;
 var string SettingsTab;        // set by EnhancedSettingsPage: which group the stock Settings page shows (game, sound, video; empty = the stock page)       // the two repurposed lists have been given their items
 
 native(3511) final function int EnhGetSetting(int Id);
@@ -558,6 +563,93 @@ state PlayerWalking
 	}
 }
 
+// ---- The game's own pause menu of the hero ----
+// The page of the pause menu turns the camera to one fixed angle (Camera.SetRotation(0, 18656, 0)) and puts the book in front of it; the stock game
+// is paused while it is open, so the camera stands still. With other players in the world the game is not paused (see EnhancedGame.SetPause), the
+// camera went on following the hero, the book was left behind it and the menu showed only the wooden board while the world went on. Here the camera is
+// held where the page put it for as long as the menu is open, with or without a pause. When the menu is closed the HUD it hid comes back.
+exec function ShowInGameMenu()
+{
+	Super.ShowInGameMenu();
+	if (!bMenuHoldHost && Player != None && GUIController(Player.GUIController) != None && GUIController(Player.GUIController).ActivePage != None)
+	{
+		bMenuHoldHost = true;
+		HostHoldLoc = vCameraStart();
+		HostHoldRot = rCameraRot();
+	}
+}
+
+event PlayerCalcView(out Actor ViewActor, out Vector CameraLocation, out Rotator CameraRotation)
+{
+	Super.PlayerCalcView(ViewActor, CameraLocation, CameraRotation);
+	if (bMenuHoldHost)
+	{
+		CameraLocation = HostHoldLoc;
+		CameraRotation = HostHoldRot;
+	}
+}
+
+// The menu hides the HUD and shows it again when its page closes; if the page goes away some other way (the window was minimized and brought back,
+// a cutscene was skipped in the same moment), the HUD stayed hidden for good. A HUD that has been hidden for 2.5 s while the hero walks, no page is open
+// and no cutscene plays, is shown again.
+function HostMenuWatch()
+{
+	local bool bPage, bCutText;
+
+	bPage = Player != None && GUIController(Player.GUIController) != None && GUIController(Player.GUIController).ActivePage != None;
+	if (bMenuHoldHost && !bPage)
+	{
+		bMenuHoldHost = false;
+	}
+	if (EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).HudTestAt > 0.0 && !bHudTested && Level.TimeSeconds > EnhancedGame(Level.Game).HudTestAt && myHUD != None)
+	{
+		bHudTested = true;
+		myHUD.SetPropertyText("bHideHUD", "True");
+		Log("[SDBG] test: the HUD is hidden by hand at t=" $ string(Level.TimeSeconds));
+	}
+	if (KWHud(myHUD) != None && KWHud(myHUD).CutTextController != None)
+	{
+		bCutText = KWHud(myHUD).CutTextController.bCutSceneInProgress;
+	}
+	if (myHUD == None || bPage || Pawn == None || bCutText || !(myHUD.GetPropertyText("bHideHUD") ~= "True") || bInCutScene() || string(GetStateName()) != "PlayerWalking")
+	{
+		HudHiddenSince = 0.0;
+		return;
+	}
+	if (HudHiddenSince == 0.0)
+	{
+		HudHiddenSince = Level.TimeSeconds;
+		return;
+	}
+	if (Level.TimeSeconds - HudHiddenSince > 2.5)
+	{
+		HudHiddenSince = 0.0;
+		myHUD.SetPropertyText("bHideHUD", "False");
+		Log("[SDBG] the HUD was hidden with no menu and no cutscene: shown again at t=" $ string(Level.TimeSeconds));
+	}
+}
+
+// Tests only (EnhHostMenu): where the camera looks and where the pause menu's book is while the menu is open.
+function LogMenuGeometry()
+{
+	local MenuBook Mb;
+	local Vector Cp, Ax, Ay, Az, D;
+	local Rotator Cr;
+	local string Cam;
+
+	Cp = vCameraStart();
+	Cr = rCameraRot();
+	GetAxes(Cr, Ax, Ay, Az);
+	Cam = GetPropertyText("Camera") $ " pri=" $ string(PlayerReplicationInfo) $ " netmode=" $ string(int(Level.NetMode)) $ " pauseable=" $ Level.Game.GetPropertyText("bPauseable") $ " adminPause=" $ Level.Game.GetPropertyText("bAdminCanPause") $ " game=" $ string(Level.Game.Class);
+	Log("[BKG] frame " $ string(HostMenuFrames) $ " paused=" $ string(Level.Pauser) $ " camStart=" $ string(Cp) $ " camRot=" $ string(Cr) $ " camera=" $ Cam $ " fov=" $ string(FovAngle) $ " desired=" $ string(DesiredFOV) $ " behind=" $ string(bBehindView) $ " hideHud=" $ myHUD.GetPropertyText("bHideHUD") $ " ctlState=" $ string(GetStateName()));
+	foreach AllActors(Class'GUI.MenuBook', Mb)
+	{
+		D = Mb.Location - Cp;
+		Log("[BKG]   book " $ string(Mb) $ " loc=" $ string(Mb.Location) $ " rot=" $ string(Mb.Rotation) $ " hidden=" $ string(int(Mb.bHidden)) $ " drawtype=" $ string(int(Mb.DrawType)) $ " mesh=" $ string(Mb.Mesh) $ " state=" $ string(Mb.GetStateName())
+			$ " | fwd=" $ string(int(D Dot Ax)) $ " right=" $ string(int(D Dot Ay)) $ " up=" $ string(int(D Dot Az)) $ " dist=" $ string(int(VSize(D))));
+	}
+}
+
 event PlayerTick(float DeltaTime)
 {
 	local GUIController GC;
@@ -571,12 +663,17 @@ event PlayerTick(float DeltaTime)
 	if (bHostMenuDone)
 	{
 		HostMenuFrames++;
+		if (HostMenuFrames == 5 || HostMenuFrames == 60 || HostMenuFrames == 238)
+		{
+			LogMenuGeometry();
+		}
 		if (HostMenuFrames == 240)
 		{
 			ConsoleCommand("shot");
 			Log("[SDBG] test: picture of the host's pause menu");
 		}
 	}
+	HostMenuWatch();
 	UndoHorPlus();
 	Super.PlayerTick(DeltaTime);
 	DoHorPlus(DeltaTime);

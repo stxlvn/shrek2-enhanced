@@ -149,6 +149,19 @@ class Installer
 
     void AtomicWriteAllText(string path, string text) { AtomicWriteAllText(path, text, new UTF8Encoding(false)); }
 
+    // The ini files keep the encoding they have: the game writes User.ini as UTF-16 with a byte order mark (the player's name is in it, a Russian one too) and
+    // Game.ini as plain bytes. Written back as UTF-8 without a mark, a Cyrillic name would come out wrong in the game. A file with no mark is read byte for byte.
+    static string ReadKeep(string path, out Encoding enc)
+    {
+        byte[] b = File.ReadAllBytes(path);
+        int skip = 0;
+        if (b.Length >= 2 && b[0] == 0xFF && b[1] == 0xFE) { enc = new UnicodeEncoding(false, true); skip = 2; }
+        else if (b.Length >= 2 && b[0] == 0xFE && b[1] == 0xFF) { enc = new UnicodeEncoding(true, true); skip = 2; }
+        else if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) { enc = new UTF8Encoding(true); skip = 3; }
+        else enc = Encoding.GetEncoding(28591);
+        return enc.GetString(b, skip, b.Length - skip);
+    }
+
     void AtomicWriteAllText(string path, string text, Encoding encoding)
     {
         BeforeChange(path);
@@ -229,11 +242,12 @@ class Installer
     {
         if (File.Exists(file))
         {
-            string text = File.ReadAllText(file);
+            Encoding enc;
+            string text = ReadKeep(file, out enc);
             string next = text;
             foreach (string[] e in IniLines)
                 next = Regex.Replace(next, "(?m)^" + Regex.Escape(e[1]) + "(?=[ \\t]*\\r?$)", e[0].Replace("$", "$$"));
-            if (next != text) { AtomicWriteAllText(file, next); Log(Path.GetFileName(file) + " restored (the two lines of the mod; your other settings stay)"); }
+            if (next != text) { AtomicWriteAllText(file, next, enc); Log(Path.GetFileName(file) + " restored (the two lines of the mod; your other settings stay)"); }
         }
         DeleteFile(file + Bak);
     }
@@ -257,9 +271,10 @@ class Installer
         string userIni = Path.Combine(Path.Combine(DocsDir, "Shrek 2"), "User.ini");
         if (File.Exists(userIni))
         {
-            string text = File.ReadAllText(userIni);
+            Encoding uenc;
+            string text = ReadKeep(userIni, out uenc);
             string clean = Regex.Replace(text, "(?ms)\\r?\\n\\[Enhanced\\.[A-Za-z]+\\].*?(?=\\r?\\n\\[|\\z)", "");
-            if (clean != text) { AtomicWriteAllText(userIni, clean); Log("User.ini: the sections of the mod are removed"); }
+            if (clean != text) { AtomicWriteAllText(userIni, clean, uenc); Log("User.ini: the sections of the mod are removed"); }
         }
         foreach (string f in Launchers) DeleteFile(Path.Combine(GameDir, f));
         Log("Shrek 2 Enhanced is removed.");
@@ -425,14 +440,15 @@ class Installer
         foreach (string m in MapFiles())
         {
             if (!File.Exists(m)) continue;
-            string text = File.ReadAllText(m);
+            Encoding enc;
+            string text = ReadKeep(m, out enc);
             foreach (string[] e in edits)
             {
                 if (text.Contains(e[0]))
                 {
                     if (!File.Exists(m + Bak)) AtomicCopy(m, m + Bak);
                     text = text.Replace(e[0], e[1]);
-                    AtomicWriteAllText(m, text);
+                    AtomicWriteAllText(m, text, enc);
                     Log(Path.GetFileName(m) + ": " + e[2] + ".");
                 }
             }
@@ -483,15 +499,17 @@ class Installer
     {
         string userIni = Path.Combine(Path.Combine(DocsDir, "Shrek 2"), "User.ini");
         if (!File.Exists(userIni)) return;
-        string text = File.ReadAllText(userIni);
+        Encoding enc;
+        string text = ReadKeep(userIni, out enc);
         text = Regex.Replace(text, "(?ms)\\r?\\n\\[Enhanced\\.EnhancedLanBeacon\\].*?(?=\\r?\\n\\[|\\z)", "");
         List<string> targets = Broadcasts();
         if (targets.Count == 0) return;
-        StringBuilder sb = new StringBuilder(text.TrimEnd());
+        // the player's text stays as it is, whatever ends it: the removal takes out the section and the line break before it, nothing else
+        StringBuilder sb = new StringBuilder(text);
         sb.Append("\r\n[Enhanced.EnhancedLanBeacon]\r\n");
         for (int i = 0; i < targets.Count; i++) sb.Append((i > 0 ? "\r\n" : "") + "ExtraTargets=" + targets[i]);
         sb.Append("\r\n");
-        AtomicWriteAllText(userIni, sb.ToString());
+        AtomicWriteAllText(userIni, sb.ToString(), enc);
         Log("User.ini: the network search will also ask: " + string.Join(", ", targets.ToArray()));
     }
 
@@ -560,11 +578,12 @@ class Installer
         foreach (string f in FontFiles())
         {
             if (!File.Exists(f)) continue;
-            string text = File.ReadAllText(f);
+            Encoding enc;
+            string text = ReadKeep(f, out enc);
             text = Regex.Replace(text, "(?m)\\r?\\nShrekTitle(Size)?=.*", "");
             if (!File.Exists(f + Bak)) AtomicCopy(f, f + Bak);
             text = text.TrimEnd() + "\r\nShrekTitle=" + face + "\r\nShrekTitleSize=29";
-            AtomicWriteAllText(f, text);
+            AtomicWriteAllText(f, text, enc);
         }
         Log("Fonts: ShrekTitle = " + face);
     }

@@ -9,6 +9,8 @@ class EnhancedDonkeyController extends ShGame.DonkeyController;
 var config bool bHorPlus;     // widen the horizontal field of view with the aspect ratio (see EnhancedFov)
 var float FovK;                // the aspect ratio relative to 4:3, asked from the viewport once a second
 var float FovCheck;
+var int HostMenuFrames;       // tests only: frames since the host's pause menu was opened (a picture is taken after 240, whatever the game clock does)
+var bool bHostMenuDone;       // tests only: see EnhHostMenu
 var bool bCursorFixed;      // the menu cursor's hot spot has been moved to the tip of the arrow
 var float LogicalFov;
 var float LogicalDesired;          // the angle the game wants; FovAngle holds the widened one between two ticks
@@ -18,7 +20,16 @@ var float MenuClock;   // tests only: see RunMenuScript
 var int MenuStep;
 var Tab_Options FixedPage;     // the stock Settings page whose video tab has been rearranged (see FixSettingsPage)
 var bool bAASet, bAFSet;
+var float DropWatch;           // tests only: until this time the visibility of the resolution list is logged
+var float DropLog;
+var GUIComboBox DropCombo;
+var bool bDropRelease;         // tests only: the mouse button pressed by the step 'clickres' is released on the next tick
 var bool bFilling;             // the two repurposed lists are being filled: their change events are not ours
+var float HudHiddenSince;      // since when the HUD has been hidden with nothing to explain it (see HostMenuWatch)
+var bool bHudTested;           // tests only: see EnhHudTest
+var bool bMenuHoldHost;        // the camera is held where the pause menu's page put it (see ShowInGameMenu)
+var Vector HostHoldLoc;
+var Rotator HostHoldRot;
 var string SettingsTab;        // set by EnhancedSettingsPage: which group the stock Settings page shows (game, sound, video; empty = the stock page)       // the two repurposed lists have been given their items
 
 native(3511) final function int EnhGetSetting(int Id);
@@ -114,6 +125,7 @@ event ClientOpenMenu(string Menu, optional bool bDisconnect, optional string Msg
 		{
 			Menu = "Enhanced.EnhancedRoomPage";
 		}
+		Log("[SDBG] menu: the front-end book opens " $ Menu);
 	}
 	Super.ClientOpenMenu(Menu, bDisconnect, Msg1, Msg2);
 }
@@ -257,6 +269,18 @@ function FixSettingsPage(GUIController GC)
 	local Tab_OptionsVideo V;
 	local float XL, XR, W, T0, P, LH, CH;
 
+	if (bDropRelease && Tab_Options(GC.ActivePage) != None)
+	{
+		bDropRelease = false;
+		DropCombo.ShowListBox(None);
+		Log("[SDBG] drop test: list shown by the click, focus " $ string(GC.FocusedControl));
+	}
+	if (DropWatch > Level.TimeSeconds && Level.TimeSeconds > DropLog && Tab_Options(GC.ActivePage) != None)
+	{
+		DropLog = Level.TimeSeconds + 0.25;
+		Log("[SDBG] drop test: t=" $ string(Level.TimeSeconds) $ " visible=" $ string(Tab_Options(GC.ActivePage).VideoTab.cbResolution.MyListBox.bVisible) $ " focus=" $ string(GC.FocusedControl) $ " list h=" $ string(Tab_Options(GC.ActivePage).VideoTab.cbResolution.MyListBox.WinHeight) $ " top=" $ string(Tab_Options(GC.ActivePage).VideoTab.cbResolution.MyListBox.WinTop));
+	}
+
 	if (GC.ActivePage == None || Tab_Options(GC.ActivePage) == None)
 	{
 		if (GC.ActivePage != FixedPage)
@@ -399,8 +423,58 @@ function RunMenuScript(GUIController GC)
 	Log("[SDBG] menu test: step " $ string(MenuStep) $ " '" $ Step $ "' on " $ string(GC.ActivePage.Class));
 	if (Tab_Options(GC.ActivePage) != None)
 	{
-		// the stock Settings page: Step is the tab to show (game, video, sound)
-		if (Step ~= "video")
+		// the stock Settings page: Step is the tab to show (game, video, sound), or "drop<list>" opens a drop-down list (res, aa, af, tex, obj)
+		if (Step ~= "dropres")
+		{
+			Tab_Options(GC.ActivePage).VideoTab.cbResolution.ShowListBox(None);
+			DropWatch = Level.TimeSeconds + 4.0;
+			Log("[SDBG] drop test: list shown now, visible=" $ string(Tab_Options(GC.ActivePage).VideoTab.cbResolution.MyListBox.bVisible));
+		}
+		else if (Left(Step, 5) ~= "click")
+		{
+			// what a click on the arrow does: the button's FocusInstead (the list) gets the focus when the button is pressed, the list is shown on release
+			// (click + res, aa, af, tex, obj)
+			DropCombo = Tab_Options(GC.ActivePage).VideoTab.cbResolution;
+			if (Mid(Step, 5) ~= "aa")
+			{
+				DropCombo = Tab_Options(GC.ActivePage).VideoTab.cbColorDepth;
+			}
+			else if (Mid(Step, 5) ~= "af")
+			{
+				DropCombo = Tab_Options(GC.ActivePage).VideoTab.cbRenderer;
+			}
+			else if (Mid(Step, 5) ~= "tex")
+			{
+				DropCombo = Tab_Options(GC.ActivePage).VideoTab.cbTextureDetail;
+			}
+			else if (Mid(Step, 5) ~= "obj")
+			{
+				DropCombo = Tab_Options(GC.ActivePage).VideoTab.cbObjectDetail;
+			}
+			Log("[SDBG] hitbox: combo bounds " $ string(DropCombo.Bounds[0]) $ "," $ string(DropCombo.Bounds[1]) $ "," $ string(DropCombo.Bounds[2]) $ "," $ string(DropCombo.Bounds[3])
+				$ " actual " $ string(DropCombo.ActualLeft()) $ "," $ string(DropCombo.ActualTop()) $ "," $ string(DropCombo.ActualWidth()) $ "," $ string(DropCombo.ActualHeight()));
+			Log("[SDBG] hitbox: arrow bounds " $ string(DropCombo.MyShowListBtn.Bounds[0]) $ "," $ string(DropCombo.MyShowListBtn.Bounds[1]) $ "," $ string(DropCombo.MyShowListBtn.Bounds[2]) $ "," $ string(DropCombo.MyShowListBtn.Bounds[3])
+				$ " actual " $ string(DropCombo.MyShowListBtn.ActualLeft()) $ "," $ string(DropCombo.MyShowListBtn.ActualTop()) $ "," $ string(DropCombo.MyShowListBtn.ActualWidth()) $ "," $ string(DropCombo.MyShowListBtn.ActualHeight()));
+			Log("[SDBG] hitbox: edit bounds " $ string(DropCombo.Edit.Bounds[0]) $ "," $ string(DropCombo.Edit.Bounds[1]) $ "," $ string(DropCombo.Edit.Bounds[2]) $ "," $ string(DropCombo.Edit.Bounds[3])
+				$ " mouse " $ string(GC.MouseX) $ "," $ string(GC.MouseY));
+			DropCombo.MyShowListBtn.FocusInstead.SetFocus(None);
+			DropWatch = Level.TimeSeconds + 4.0;
+			Log("[SDBG] drop test: focus on the list before the click: " $ string(GC.FocusedControl));
+			bDropRelease = true;
+		}
+		else if (Step ~= "dropaa")
+		{
+			Tab_Options(GC.ActivePage).VideoTab.cbColorDepth.ShowListBox(None);
+		}
+		else if (Step ~= "dropaf")
+		{
+			Tab_Options(GC.ActivePage).VideoTab.cbRenderer.ShowListBox(None);
+		}
+		else if (Step ~= "droptex")
+		{
+			Tab_Options(GC.ActivePage).VideoTab.cbTextureDetail.ShowListBox(None);
+		}
+		else if (Step ~= "video")
 		{
 			Tab_Options(GC.ActivePage).tabOptions.ActiveTab = Tab_Options(GC.ActivePage).VideoTab.MyButton;
 		}
@@ -465,7 +539,7 @@ function DoHorPlus(float DeltaTime)
 		FovCheck = 1.0;
 		FovK = Class'Enhanced.EnhancedFov'.static.AspectK(ConsoleCommand("GetCurrentRes"));
 	}
-	if (bHorPlus && FovK > 1.01)
+	if (bHorPlus && FovK > 1.01 && !EnhancedGame(Level.Game).Off("nohorplus"))
 	{
 		LogicalFov = FovAngle;
 		LogicalDesired = DesiredFOV;
@@ -489,10 +563,117 @@ state PlayerWalking
 	}
 }
 
+// ---- The game's own pause menu of the hero ----
+// The page of the pause menu turns the camera to one fixed angle (Camera.SetRotation(0, 18656, 0)) and puts the book in front of it; the stock game
+// is paused while it is open, so the camera stands still. With other players in the world the game is not paused (see EnhancedGame.SetPause), the
+// camera went on following the hero, the book was left behind it and the menu showed only the wooden board while the world went on. Here the camera is
+// held where the page put it for as long as the menu is open, with or without a pause. When the menu is closed the HUD it hid comes back.
+exec function ShowInGameMenu()
+{
+	Super.ShowInGameMenu();
+	if (!bMenuHoldHost && Player != None && GUIController(Player.GUIController) != None && GUIController(Player.GUIController).ActivePage != None)
+	{
+		bMenuHoldHost = true;
+		HostHoldLoc = vCameraStart();
+		HostHoldRot = rCameraRot();
+	}
+}
+
+event PlayerCalcView(out Actor ViewActor, out Vector CameraLocation, out Rotator CameraRotation)
+{
+	Super.PlayerCalcView(ViewActor, CameraLocation, CameraRotation);
+	if (bMenuHoldHost)
+	{
+		CameraLocation = HostHoldLoc;
+		CameraRotation = HostHoldRot;
+	}
+}
+
+// The menu hides the HUD and shows it again when its page closes; if the page goes away some other way (the window was minimized and brought back,
+// a cutscene was skipped in the same moment), the HUD stayed hidden for good. A HUD that has been hidden for 2.5 s while the hero walks, no page is open
+// and no cutscene plays, is shown again.
+function HostMenuWatch()
+{
+	local bool bPage, bCutText;
+
+	bPage = Player != None && GUIController(Player.GUIController) != None && GUIController(Player.GUIController).ActivePage != None;
+	if (bMenuHoldHost && !bPage)
+	{
+		bMenuHoldHost = false;
+	}
+	if (EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).HudTestAt > 0.0 && !bHudTested && Level.TimeSeconds > EnhancedGame(Level.Game).HudTestAt && myHUD != None)
+	{
+		bHudTested = true;
+		myHUD.SetPropertyText("bHideHUD", "True");
+		Log("[SDBG] test: the HUD is hidden by hand at t=" $ string(Level.TimeSeconds));
+	}
+	if (KWHud(myHUD) != None && KWHud(myHUD).CutTextController != None)
+	{
+		bCutText = KWHud(myHUD).CutTextController.bCutSceneInProgress;
+	}
+	if (myHUD == None || bPage || Pawn == None || bCutText || !(myHUD.GetPropertyText("bHideHUD") ~= "True") || bInCutScene() || string(GetStateName()) != "PlayerWalking")
+	{
+		HudHiddenSince = 0.0;
+		return;
+	}
+	if (HudHiddenSince == 0.0)
+	{
+		HudHiddenSince = Level.TimeSeconds;
+		return;
+	}
+	if (Level.TimeSeconds - HudHiddenSince > 2.5)
+	{
+		HudHiddenSince = 0.0;
+		myHUD.SetPropertyText("bHideHUD", "False");
+		Log("[SDBG] the HUD was hidden with no menu and no cutscene: shown again at t=" $ string(Level.TimeSeconds));
+	}
+}
+
+// Tests only (EnhHostMenu): where the camera looks and where the pause menu's book is while the menu is open.
+function LogMenuGeometry()
+{
+	local MenuBook Mb;
+	local Vector Cp, Ax, Ay, Az, D;
+	local Rotator Cr;
+	local string Cam;
+
+	Cp = vCameraStart();
+	Cr = rCameraRot();
+	GetAxes(Cr, Ax, Ay, Az);
+	Cam = GetPropertyText("Camera") $ " pri=" $ string(PlayerReplicationInfo) $ " netmode=" $ string(int(Level.NetMode)) $ " pauseable=" $ Level.Game.GetPropertyText("bPauseable") $ " adminPause=" $ Level.Game.GetPropertyText("bAdminCanPause") $ " game=" $ string(Level.Game.Class);
+	Log("[BKG] frame " $ string(HostMenuFrames) $ " paused=" $ string(Level.Pauser) $ " camStart=" $ string(Cp) $ " camRot=" $ string(Cr) $ " camera=" $ Cam $ " fov=" $ string(FovAngle) $ " desired=" $ string(DesiredFOV) $ " behind=" $ string(bBehindView) $ " hideHud=" $ myHUD.GetPropertyText("bHideHUD") $ " ctlState=" $ string(GetStateName()));
+	foreach AllActors(Class'GUI.MenuBook', Mb)
+	{
+		D = Mb.Location - Cp;
+		Log("[BKG]   book " $ string(Mb) $ " loc=" $ string(Mb.Location) $ " rot=" $ string(Mb.Rotation) $ " hidden=" $ string(int(Mb.bHidden)) $ " drawtype=" $ string(int(Mb.DrawType)) $ " mesh=" $ string(Mb.Mesh) $ " state=" $ string(Mb.GetStateName())
+			$ " | fwd=" $ string(int(D Dot Ax)) $ " right=" $ string(int(D Dot Ay)) $ " up=" $ string(int(D Dot Az)) $ " dist=" $ string(int(VSize(D))));
+	}
+}
+
 event PlayerTick(float DeltaTime)
 {
 	local GUIController GC;
 
+	if (!bHostMenuDone && EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).HostMenuAt > 0.0 && Level.TimeSeconds > EnhancedGame(Level.Game).HostMenuAt && Pawn != None)
+	{
+		bHostMenuDone = true;
+		Log("[SDBG] test: the host's own pause menu is opened (ShowInGameMenu)");
+		ConsoleCommand("ShowInGameMenu");
+	}
+	if (bHostMenuDone)
+	{
+		HostMenuFrames++;
+		if (HostMenuFrames == 5 || HostMenuFrames == 60 || HostMenuFrames == 238)
+		{
+			LogMenuGeometry();
+		}
+		if (HostMenuFrames == 240)
+		{
+			ConsoleCommand("shot");
+			Log("[SDBG] test: picture of the host's pause menu");
+		}
+	}
+	HostMenuWatch();
 	UndoHorPlus();
 	Super.PlayerTick(DeltaTime);
 	DoHorPlus(DeltaTime);
@@ -507,6 +688,11 @@ event PlayerTick(float DeltaTime)
 		MenuClock += DeltaTime;
 		if (GC != None)
 		{
+			if (EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).CursorTestX > 0.0)
+			{
+				GC.MouseX = EnhancedGame(Level.Game).CursorTestX;
+				GC.MouseY = EnhancedGame(Level.Game).CursorTestY;
+			}
 			if (!bCursorFixed)
 			{
 				// the stock book cursor is an arrow of 64 x 64 whose tip is at the top centre (32, 1), but its hot spot is set to (0.25, 0.25) of the picture: a click

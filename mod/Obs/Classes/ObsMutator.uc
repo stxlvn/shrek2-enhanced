@@ -11,12 +11,16 @@ var bool bVolLogged;
 var config float MenuAt;     // [Obs.ObsMutator] MenuAt=<seconds> in User.ini: the pause menu is opened that long after the hero is ready
 var bool bMenuDone, bMenuRead, bCamLogged;
 var float NextStrafeLog;
+var float NextBanditLog;
+var bool bBanditShot;        // one engine picture when the bandit who talks is near the hero     // URL option ?ObsBandit=1: every 3 s the state of every bandit-like pawn (hidden, animation, distance to the hero)
 
 event Tick(float DeltaTime)
 {
 	local Controller C;
-	local Pawn P;
+	local Pawn P, Q;
 	local PhysicsVolume V;
+	local name N0;
+	local float F0, R0;
 
 	for (C = Level.ControllerList; C != None; C = C.NextController)
 	{
@@ -43,6 +47,27 @@ event Tick(float DeltaTime)
 		Log("[OBS] READY pawn " $ string(P) $ " z=" $ string(P.Location.Z));
 	}
 	T += DeltaTime;
+	if (T >= NextBanditLog && InStr(Level.GetLocalURL(), "ObsBandit=") >= 0)
+	{
+		NextBanditLog = T + 3.0;
+		foreach AllActors(Class'Engine.Pawn', Q)
+		{
+			if (InStr(string(Q.Class), "Bandit") >= 0 || InStr(string(Q.Class), "WheelStealer") >= 0)
+			{
+				N0 = 'None';
+				Q.GetAnimParams(0, N0, F0, R0);
+				Log("[OBSB] t=" $ string(T) $ " " $ string(Q.Name) $ " cls=" $ string(Q.Class) $ " hid=" $ string(int(Q.bHidden)) $ " dt=" $ string(int(Q.DrawType)) $ " anim=" $ string(N0) $ " frame=" $ string(F0)
+					$ " state=" $ string(Q.GetStateName()) $ " ctl=" $ string(Q.Controller) $ " dist=" $ string(int(VSize(Q.Location - P.Location))) $ " loc=" $ string(int(Q.Location.X)) $ "," $ string(int(Q.Location.Y)) $ "," $ string(int(Q.Location.Z))
+					$ " hero=" $ string(int(P.Location.X)) $ "," $ string(int(P.Location.Y)) $ "," $ string(int(P.Location.Z)));
+				if (!bBanditShot && InStr(string(Q.Class), "BanditSpecial") >= 0 && VSize(Q.Location - P.Location) < 1800.0 && T > 4.0)
+				{
+					bBanditShot = true;
+					PlayerController(C).ConsoleCommand("shot");
+					Log("[OBSB] picture taken at t=" $ string(T) $ " with " $ string(Q.Name) $ " at " $ string(int(VSize(Q.Location - P.Location))) $ " units");
+				}
+			}
+		}
+	}
 	if (bReady && !bCamLogged && KWHeroController(C) != None)
 	{
 		bCamLogged = true;

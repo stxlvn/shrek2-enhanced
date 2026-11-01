@@ -642,6 +642,10 @@ static void hw_tune(void)
 	cache = g_hw.ramMB >= 16000 ? 256 : (g_hw.ramMB >= 8000 ? 128 : 32);
 	snprintf(val, sizeof val, "%d", cache);
 	changed += ini_tune(&buf, &len, "Engine.GameEngine", "CacheSizeMegs", "32", val);
+	/* the stock net rates (10000 bytes a second for an Internet player, 20000 for the host's side of a client) sit close to the peaks of the mod's world sync */
+	changed += ini_tune(&buf, &len, "Engine.Player", "ConfiguredInternetSpeed", "10000", "25000");
+	changed += ini_tune(&buf, &len, "Engine.Player", "ConfiguredLanSpeed", "20000", "50000");
+	changed += ini_tune(&buf, &len, "IpDrv.TcpNetDriver", "MaxClientRate", "20000", "50000");
 	if (changed) {
 		snprintf(bak, sizeof bak, "%s.before-enhanced-tune", path);
 		if (GetFileAttributesA(bak) == INVALID_FILE_ATTRIBUTES)
@@ -934,16 +938,34 @@ static HRESULT __stdcall my_Present(void *dev, const void *src, const void *dst,
 			grab_frame(dev);
 		}
 	}
+	LARGE_INTEGER pa, pb;
+	QueryPerformanceCounter(&pa);
 	HRESULT hr = real_Present(dev, src, dst, wnd, dirty);
+	QueryPerformanceCounter(&pb);
 	{
+		/* [FPS] once per 5 s: frames, average rate, the longest frame, and how much of the time the process waited inside Present (the graphics
+		 * adapter or the screen); the pid tells the host's line from the guest's when both write one log */
 		static DWORD calls, t0;
+		static LONGLONG lastEnd, worst, inPresent, qf;
 		DWORD tn = GetTickCount();
+		if (!qf) {
+			LARGE_INTEGER f;
+			QueryPerformanceFrequency(&f);
+			qf = f.QuadPart;
+		}
+		if (lastEnd && pb.QuadPart - lastEnd > worst)
+			worst = pb.QuadPart - lastEnd;
+		inPresent += pb.QuadPart - pa.QuadPart;
+		lastEnd = pb.QuadPart;
 		if (!t0)
 			t0 = tn;
 		calls++;
 		if (tn - t0 >= 5000) {
-			enh_log("Present: %lu calls in %lu ms (limit %d)", (unsigned long)calls, (unsigned long)(tn - t0), g_maxfps);
+			enh_log("[FPS] pid %lu: %lu frames in %lu ms = %.1f fps, longest frame %.0f ms, %.0f %% of the time inside Present (limit %d)", GetCurrentProcessId(), (unsigned long)calls,
+				(unsigned long)(tn - t0), calls * 1000.0 / (tn - t0), worst * 1000.0 / qf, inPresent * 100.0 * 1000.0 / qf / (tn - t0), g_maxfps);
 			calls = 0;
+			worst = 0;
+			inPresent = 0;
 			t0 = tn;
 		}
 	}
@@ -1315,6 +1337,199 @@ static void __attribute__((thiscall)) nat_canvasfont(void *self, FFrame *stack, 
 	}
 }
 
+/* ---- Network: byte counters, and (tests only) packet loss and lag --------------------------------------------------------
+ * IpDrv.dll sends and receives the game's UDP through WSOCK32 (sendto / recvfrom, imported by ordinal). Once IpDrv.dll is loaded a thread
+ * replaces those two entries of its import table. Every second, while there is traffic, enhnative.log gets one "[NET]" line per process:
+ * payload bytes and packets sent and received, the largest packet, packets over 1000 bytes and packets the simulation dropped.
+ * SHREK2_NETSIM="loss=5,lag=80,jitter=20" (environment of the process, never read from an ini) makes the OUTGOING packets of this process get
+ * lost by 5 %, arrive 80 ms late, plus up to 20 ms of random extra delay (so some arrive out of order). With the variable set in both
+ * processes of a test every direction gets the value (a round trip is twice the lag). */
+typedef int (WINAPI *SendToFn)(UINT_PTR s, const char *buf, int len, int flags, const void *to, int tolen);
+typedef int (WINAPI *RecvFromFn)(UINT_PTR s, char *buf, int len, int flags, void *from, int *fromlen);
+static SendToFn real_sendto;
+static RecvFromFn real_recvfrom;
+static volatile LONG n_outB, n_outP, n_inB, n_inP, n_drop, n_big, n_maxout;
+static int g_simLoss, g_simLag, g_simJitter;   /* loss in hundredths of a percent, times in ms */
+
+typedef struct { UINT_PTR s; int flags, tolen, len; unsigned char to[32]; unsigned char data[1600]; LONGLONG due; int used; } NetDelay;
+#define NET_QUEUE 512
+static NetDelay g_nq[NET_QUEUE];
+static CRITICAL_SECTION g_nqcs;
+static LARGE_INTEGER g_qpf;
+
+static LONGLONG net_now_us(void)
+{
+	LARGE_INTEGER t;
+	QueryPerformanceCounter(&t);
+	return t.QuadPart * 1000000 / g_qpf.QuadPart;
+}
+
+static int WINAPI my_sendto(UINT_PTR s, const char *buf, int len, int flags, const void *to, int tolen)
+{
+	InterlockedExchangeAdd(&n_outB, len);
+	InterlockedIncrement(&n_outP);
+	if (len > 1000)
+		InterlockedIncrement(&n_big);
+	if (len > n_maxout)
+		n_maxout = len;
+	if (g_simLoss > 0 && rand() % 10000 < g_simLoss) {
+		InterlockedIncrement(&n_drop);
+		return len;
+	}
+	if (g_simLag > 0 && len <= (int)sizeof g_nq[0].data && tolen <= (int)sizeof g_nq[0].to) {
+		int i;
+		EnterCriticalSection(&g_nqcs);
+		for (i = 0; i < NET_QUEUE && g_nq[i].used; i++)
+			;
+		if (i < NET_QUEUE) {
+			g_nq[i].s = s;
+			g_nq[i].flags = flags;
+			g_nq[i].tolen = tolen;
+			g_nq[i].len = len;
+			memcpy(g_nq[i].to, to, tolen);
+			memcpy(g_nq[i].data, buf, len);
+			g_nq[i].due = net_now_us() + 1000LL * (g_simLag + (g_simJitter > 0 ? rand() % (g_simJitter + 1) : 0));
+			g_nq[i].used = 1;
+			LeaveCriticalSection(&g_nqcs);
+			return len;
+		}
+		LeaveCriticalSection(&g_nqcs);   /* queue full: send at once */
+	}
+	return real_sendto(s, buf, len, flags, to, tolen);
+}
+
+static int WINAPI my_recvfrom(UINT_PTR s, char *buf, int len, int flags, void *from, int *fromlen)
+{
+	int r = real_recvfrom(s, buf, len, flags, from, fromlen);
+	if (r > 0) {
+		InterlockedExchangeAdd(&n_inB, r);
+		InterlockedIncrement(&n_inP);
+	}
+	return r;
+}
+
+static DWORD WINAPI net_delay_thread(LPVOID unused)
+{
+	typedef UINT (WINAPI *TimeFn)(UINT);
+	HMODULE mm = LoadLibraryA("winmm.dll");
+	TimeFn tbp = mm ? (TimeFn)GetProcAddress(mm, "timeBeginPeriod") : NULL;
+	(void)unused;
+	if (tbp)
+		tbp(1);
+	for (;;) {
+		int i, best;
+		LONGLONG now = net_now_us();
+		EnterCriticalSection(&g_nqcs);
+		for (;;) {   /* the earliest due packet first */
+			best = -1;
+			for (i = 0; i < NET_QUEUE; i++)
+				if (g_nq[i].used && g_nq[i].due <= now && (best < 0 || g_nq[i].due < g_nq[best].due))
+					best = i;
+			if (best < 0)
+				break;
+			real_sendto(g_nq[best].s, (const char *)g_nq[best].data, g_nq[best].len, g_nq[best].flags, g_nq[best].to, g_nq[best].tolen);
+			g_nq[best].used = 0;
+		}
+		LeaveCriticalSection(&g_nqcs);
+		Sleep(1);
+	}
+	return 0;
+}
+
+static int net_patch_iat(HMODULE mod, void *f_send, void *f_recv)
+{
+	BYTE *base = (BYTE *)mod;
+	IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+	IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+	IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	IMAGE_IMPORT_DESCRIPTOR *imp;
+	int n = 0;
+	if (!dir->VirtualAddress)
+		return 0;
+	for (imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress); imp->Name; imp++) {
+		IMAGE_THUNK_DATA *thunk;
+		if (_stricmp((char *)(base + imp->Name), "wsock32.dll") != 0 && _stricmp((char *)(base + imp->Name), "ws2_32.dll") != 0)
+			continue;
+		for (thunk = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk); thunk->u1.Function; thunk++) {
+			void *repl = NULL;
+			DWORD old;
+			if (thunk->u1.Function == (DWORD_PTR)f_send)
+				repl = (void *)my_sendto;
+			else if (thunk->u1.Function == (DWORD_PTR)f_recv)
+				repl = (void *)my_recvfrom;
+			if (!repl)
+				continue;
+			if (VirtualProtect(&thunk->u1.Function, sizeof(void *), PAGE_READWRITE, &old)) {
+				thunk->u1.Function = (DWORD_PTR)repl;
+				VirtualProtect(&thunk->u1.Function, sizeof(void *), old, &old);
+				n++;
+			}
+		}
+	}
+	return n;
+}
+
+static DWORD WINAPI net_main(LPVOID unused)
+{
+	int i;
+	HMODULE ip = NULL, ws = NULL;
+	(void)unused;
+	for (i = 0; i < 6000; i++) {   /* the engine loads IpDrv.dll when it starts a network driver */
+		ip = GetModuleHandleA("IpDrv.dll");
+		ws = GetModuleHandleA("wsock32.dll");
+		if (ip && ws)
+			break;
+		Sleep(100);
+	}
+	if (!ip || !ws)
+		return 0;
+	real_sendto = (SendToFn)GetProcAddress(ws, "sendto");
+	real_recvfrom = (RecvFromFn)GetProcAddress(ws, "recvfrom");
+	if (!real_sendto || !real_recvfrom) {
+		enh_log("net: sendto/recvfrom not found in wsock32.dll");
+		return 0;
+	}
+	i = net_patch_iat(ip, (void *)real_sendto, (void *)real_recvfrom);
+	enh_log("net: IpDrv.dll import table patched (%d entries), simulation: loss %d.%02d %%, lag %d ms, jitter %d ms", i, g_simLoss / 100, g_simLoss % 100, g_simLag, g_simJitter);
+	if (i == 0)
+		return 0;
+	for (;;) {
+		long ob, op, ib, ip2, dr, bg, mx;
+		Sleep(1000);
+		ob = InterlockedExchange(&n_outB, 0);
+		op = InterlockedExchange(&n_outP, 0);
+		ib = InterlockedExchange(&n_inB, 0);
+		ip2 = InterlockedExchange(&n_inP, 0);
+		dr = InterlockedExchange(&n_drop, 0);
+		bg = InterlockedExchange(&n_big, 0);
+		mx = InterlockedExchange(&n_maxout, 0);
+		if (op || ip2)
+			enh_log("[NET] pid %lu out %ld B/s %ld pkt/s (max %ld, over 1000: %ld, dropped %ld) in %ld B/s %ld pkt/s", GetCurrentProcessId(), ob, op, mx, bg, dr, ib, ip2);
+	}
+	return 0;
+}
+
+static void net_init(void)
+{
+	char v[160], *tok;
+	InitializeCriticalSection(&g_nqcs);
+	QueryPerformanceFrequency(&g_qpf);
+	if (GetEnvironmentVariableA("SHREK2_NETSIM", v, sizeof v) > 0) {
+		for (tok = strtok(v, ", "); tok; tok = strtok(NULL, ", ")) {
+			if (strncmp(tok, "loss=", 5) == 0)
+				g_simLoss = (int)(atof(tok + 5) * 100.0 + 0.5);
+			else if (strncmp(tok, "lag=", 4) == 0)
+				g_simLag = atoi(tok + 4);
+			else if (strncmp(tok, "jitter=", 7) == 0)
+				g_simJitter = atoi(tok + 7);
+		}
+		srand((unsigned)GetTickCount() ^ GetCurrentProcessId());
+		if (g_simLag > 0)
+			CreateThread(NULL, 0, net_delay_thread, NULL, 0, NULL);
+	}
+	CreateThread(NULL, 0, net_main, NULL, 0, NULL);
+}
+
 static void native_init(void)
 {
 	/* Game.exe imports d3d8.dll, so this runs before the engine reads Game.ini: the tuning applies to this very start. DXGI must not be
@@ -1322,6 +1537,7 @@ static void native_init(void)
 	load_private_fonts();
 	hw_probe_quick();
 	hw_tune();
+	net_init();
 	CreateThread(NULL, 0, pf_main, NULL, 0, NULL);
 	CreateThread(NULL, 0, hw_thread, NULL, 0, NULL);
 	HMODULE core = GetModuleHandleA("Core.dll");

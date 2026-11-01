@@ -33,6 +33,13 @@ var array<Controller> CkptPassed;   // the players that have been at the checkpo
 var EnhancedTicker Ticker;
 var Vector LastCheckpointLoc;       // where the last counted checkpoint was
 var bool bHaveCheckpointLoc;
+var bool bCkptAnchor;               // the waiting checkpoint is a place to come back to (a fairy or a level start), see CheckpointAnchor
+const CkptStartWindow = 20.0;       // seconds after a level has started in which a save of the engine counts as the level's start
+const FairyReach = 2500.0;          // a save this close to a save fairy belongs to that fairy
+var float HudTestAt;                // URL option EnhHudTest=<seconds> (tests): the host's HUD is hidden by hand; it must come back by itself
+var float CkptTestAt;               // URL option EnhCkptTest=<seconds> (tests): a save of a cutscene's end, then a save next to a fairy
+var int CkptTestStep;
+var Actor CkptTestFairy;
 
 // The leash: players may not drift apart for good, and the exits of a level stay shut until everybody is there.
 var() config float LeashDistance;   // maximum distance between two players
@@ -197,6 +204,8 @@ event InitGame(string Options, out string Error)
 	HostMenuAt = float(ParseOption(Options, "EnhHostMenu"));
 	GotoAt = float(ParseOption(Options, "EnhGotoAt"));
 	BonusTestAt = float(ParseOption(Options, "EnhBonusAt"));
+	CkptTestAt = float(ParseOption(Options, "EnhCkptTest"));
+	HudTestAt = float(ParseOption(Options, "EnhHudTest"));
 	GotoMap = ParseOption(Options, "EnhGoto");
 	if (ParseOption(Options, "EnhCursor") != "")
 	{
@@ -309,12 +318,14 @@ event PostBeginPlay()
 
 }
 
-// One player's window losing focus must not freeze the shared world.
+// With other players in the world, one player's window losing focus (or his pause menu) must not freeze the shared world. A single-player game
+// pauses as the original does: the pause menu's book is placed for a camera that stands still while the game is paused; without the pause the camera
+// kept following the hero, the book was behind it and the menu showed only the wooden board (while the world went on and the HUD stayed hidden).
 function bool SetPause(bool bPause, PlayerController P)
 {
-	if (Off("allowpause"))
+	if ((Level.NetMode == NM_Standalone && !Off("nopause")) || Off("allowpause"))   // nopause: tests (the quiet test windows are never focused and the engine pauses them)
 	{
-		return Super.SetPause(bPause, P);   // test: the stock pause
+		return Super.SetPause(bPause, P);
 	}
 	Log("Enhanced: pause request ignored, pause=" $ string(bPause));
 	return false;
@@ -2164,10 +2175,82 @@ function GuestJumpTick(float DeltaTime)
 	}
 }
 
+// Tests only (EnhCkptTest=<seconds>): a save of a cutscene's end in the middle of the level must leave the checkpoint place alone; a save next to a fairy
+// must put it at the fairy.
+function CkptTest()
+{
+	local Controller C, Host;
+	local Actor A, Point, Fairy;
+	local Vector V;
+
+	if (CkptTestAt <= 0.0 || CkptTestStep >= 4 || Level.TimeSeconds < CkptTestAt + float(CkptTestStep) * 3.0)
+	{
+		return;
+	}
+	for (C = Level.ControllerList; C != None && Host == None; C = C.NextController)
+	{
+		if (PlayerController(C) != None && C.Pawn != None)
+		{
+			Host = C;
+		}
+	}
+	if (Host == None)
+	{
+		return;
+	}
+	if (CkptTestStep == 0)
+	{
+		T("CKPTTEST 1: have=" $ string(bHaveCheckpointLoc) $ " loc=" $ string(LastCheckpointLoc) $ ", a cutscene's save in the middle of the level (t=" $ string(Level.TimeSeconds) $ ")");
+		OnCheckpointRequest(Host, "SaveSlottedGame 1");
+	}
+	else if (CkptTestStep == 1)
+	{
+		T("CKPTTEST 2: after the cutscene's save have=" $ string(bHaveCheckpointLoc) $ " loc=" $ string(LastCheckpointLoc) $ " (it must be unchanged)");
+		foreach AllActors(Class'Engine.Actor', A)
+		{
+			if (A.IsA('SHSavePoint'))
+			{
+				Point = A;
+			}
+			else if (A.IsA('SavePointFairy'))
+			{
+				Fairy = A;
+			}
+		}
+		if (Point == None)
+		{
+			Point = Fairy;
+		}
+		CkptTestFairy = Point;
+		if (Point == None)
+		{
+			T("CKPTTEST: no fairy in this level");
+			CkptTestStep = 4;
+			return;
+		}
+		V = Point.Location;
+		V.X += 300.0;
+		V.Z += 80.0;
+		Host.Pawn.SetLocation(V);
+		T("CKPTTEST: the host stands 300 units from the fairy " $ string(Point) $ " at " $ string(Point.Location));
+	}
+	else if (CkptTestStep == 2)
+	{
+		OnCheckpointRequest(Host, "SaveGame");
+	}
+	else if (CkptTestStep == 3)
+	{
+		T("CKPTTEST 3: after the fairy's save have=" $ string(bHaveCheckpointLoc) $ " loc=" $ string(LastCheckpointLoc) $ " distance to the fairy " $ string(int(VSize(LastCheckpointLoc - CkptTestFairy.Location))));
+	}
+	CkptTestStep++;
+}
+
 function GotoTick()
 {
 	local Controller C;
 	local EnhancedLeaveBonus X;
+
+	CkptTest();
 
 	if (!bBonusTested && BonusTestAt > 0.0 && Level.TimeSeconds > BonusTestAt)
 	{
@@ -3101,9 +3184,70 @@ function ReturnFromBonus()
 	Level.ServerTravel(R.Map $ Opt, false);
 }
 
+// Whether a save request of the engine is a "checkpoint" in the sense of the mod: the place the leash brings a runaway back to and a late guest is
+// put at. That is the save of a save fairy, or a save of a level's start. The end of a cutscene also asks for a save (the exit command "SaveGame N" of
+// KWCutScene, it arrives as SaveSlottedGame in the middle of a level): its record is taken as before, but the place where the players happened to
+// stand is no place to come back to. For a fairy the place is the fairy's own, on the ground, not where the player stood when her wand finished.
+function bool CheckpointAnchor(string Why, out Vector Origin)
+{
+	local Actor A, Point, Fairy;
+	local float D, DPoint, DFairy;
+	local Vector HitLoc, HitNorm, From, To;
+
+	if (Left(Why, 15) ~= "SaveSlottedGame" && Level.TimeSeconds > CkptStartWindow)
+	{
+		return false;
+	}
+	DPoint = FairyReach;
+	DFairy = FairyReach;
+	foreach AllActors(Class'Engine.Actor', A)
+	{
+		if (A.IsA('SHSavePoint'))
+		{
+			D = VSize(A.Location - Origin);
+			if (D < DPoint)
+			{
+				DPoint = D;
+				Point = A;
+			}
+		}
+		else if (A.IsA('SavePointFairy'))
+		{
+			D = VSize(A.Location - Origin);
+			if (D < DFairy)
+			{
+				DFairy = D;
+				Fairy = A;
+			}
+		}
+	}
+	if (Point == None)
+	{
+		Point = Fairy;
+	}
+	if (Point != None)
+	{
+		From = Point.Location;
+		From.Z += 80.0;
+		To = Point.Location;
+		To.Z -= 600.0;
+		if (Trace(HitLoc, HitNorm, To, From, false) != None)
+		{
+			Origin = HitLoc;
+		}
+		else
+		{
+			Origin = Point.Location;
+		}
+		T("checkpoint place: the fairy " $ string(Point) $ " at " $ string(Origin));
+	}
+	return true;
+}
+
 function OnCheckpointRequest(Controller Who, string Why)
 {
 	local Vector Origin;
+	local bool bAnchor;
 
 	if (InStr(Caps(MapName()), "BEANSTALK") >= 0)
 	{
@@ -3116,9 +3260,14 @@ function OnCheckpointRequest(Controller Who, string Why)
 	{
 		Origin = Who.Pawn.Location;
 	}
+	bAnchor = CheckpointAnchor(Why, Origin);
+	if (!bAnchor)
+	{
+		T("this save is not a fairy's or a level start's (the end of a cutscene or a script): the record is taken, but it is not a place to come back to");
+	}
 	if (bCkptPending)
 	{
-		if (VSize(Origin - CkptLoc) <= CheckpointRadius)
+		if (VSize(Origin - CkptLoc) <= CheckpointRadius && (bCkptAnchor || !bAnchor))
 		{
 			T("checkpoint request merged with the one that is waiting");
 			return;
@@ -3127,9 +3276,15 @@ function OnCheckpointRequest(Controller Who, string Why)
 	}
 	else if (Level.TimeSeconds - LastCheckpointTime < 1.0 && LastCheckpointTime > 0.0)
 	{
+		if (bAnchor)
+		{
+			LastCheckpointLoc = Origin;
+			bHaveCheckpointLoc = true;
+		}
 		T("checkpoint merged with the previous request");
 		return;
 	}
+	bCkptAnchor = bAnchor;
 	CkptLoc = Origin;
 	CkptWhy = Why;
 	CkptPassed.Length = 0;
@@ -3146,8 +3301,11 @@ function OnCheckpointRequest(Controller Who, string Why)
 function FinishCheckpoint(string How)
 {
 	bCkptPending = false;
-	LastCheckpointLoc = CkptLoc;
-	bHaveCheckpointLoc = true;
+	if (bCkptAnchor)
+	{
+		LastCheckpointLoc = CkptLoc;
+		bHaveCheckpointLoc = true;
+	}
 	LastCheckpointTime = Level.TimeSeconds;
 	T("checkpoint counts (" $ How $ "): " $ string(PlayersWithPawn()) $ " player(s), recording");
 	if (SessionId != "")

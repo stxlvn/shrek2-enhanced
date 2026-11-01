@@ -18,6 +18,7 @@ var int Part;                          // host: this actor carries the actors wh
 // host
 var array<string> SlotKey;            // slot -> the actor's name (the same index space as Rec)
 var array<Actor> SlotActor;
+var float PosTime[80];                // host: when the record of a creature was last made
 var array<Actor> WideSet;             // actors made always relevant because the players are near; let go of when they are not
 
 // client
@@ -25,8 +26,19 @@ var Actor Twin[80];
 var string TwinRec[80];
 var string TwinPos[80];
 var Vector Target[80];
+var float LastApply[80];              // client: when the record of a twin was last applied and how long the one before took (the twin drifts to its place in about that time)
+var float Interval[80];
+var int Moving[80];                  // the twin is still on its way to its record's place (only these are moved every frame)
+var float SlotClock;                  // the records are looked through ten times a second, not every frame
 var string Tried[80];
 var name TmpAnim;
+var float SpinClock;                  // client: when the pickups to turn were last collected
+var int SpinFixed;
+var Actor SpinWatch[5];               // pickups the player can see, watched for half a second after they were given their rotation, to see that they turn
+var int SpinYaw0[5];
+var float SpinWatchClock;
+var bool bSpinWatching;
+var int SpinWatchRuns;
 
 replication
 {
@@ -91,7 +103,26 @@ function bool Twinnable(Actor A)
 	return A.DrawType == DT_Mesh && A.Mesh != None && !A.bHidden;
 }
 
-function string PosOf(Actor A)
+// The stamp at the end of a record makes the text change now and then, so a record that was lost is sent again. A record that does not change is not sent at
+// all (the engine compares with what it sent last), so a torch or a fire costs nothing between two stamps. It used to be one counter for all records, changing
+// every 2 s: ~100 records were sent again every 2 s (~2.4 KB/s of the ~3 KB/s the host sent). Now every record has its own stamp with its own phase: scenery
+// repeats every StampStatic seconds (a lost record is a torch that appears late), a creature every StampMoving seconds, the repeats spread over the period.
+const StampStatic = 40.0;
+const StampMoving = 6.0;
+
+function int StampFor(int Slot, bool bMoving)
+{
+	local float Period;
+
+	Period = StampStatic;
+	if (bMoving)
+	{
+		Period = StampMoving;
+	}
+	return int((Level.TimeSeconds + float(Slot) * (Period / float(MaxTwins))) / Period) & 255;
+}
+
+function string PosOf(Actor A, int Slot)
 {
 	local string S, Em, An;
 	local Emitter E;
@@ -116,7 +147,7 @@ function string PosOf(Actor A)
 		A.GetAnimParams(0, N0, F, R);
 		An = string(N0);
 	}
-	S = string(int(A.Location.X)) $ "," $ string(int(A.Location.Y)) $ "," $ string(int(A.Location.Z)) $ "," $ string(A.Rotation.Yaw & 65535) $ "," $ string(int(A.bHidden)) $ "," $ An $ "," $ Em $ "," $ string(int(A.DrawScale * 100.0)) $ "," $ string(Stamp);
+	S = string(int(A.Location.X)) $ "," $ string(int(A.Location.Y)) $ "," $ string(int(A.Location.Z)) $ "," $ string(A.Rotation.Yaw & 65535) $ "," $ string(int(A.bHidden)) $ "," $ An $ "," $ Em $ "," $ string(int(A.DrawScale * 100.0)) $ "," $ string(StampFor(Slot, Pawn(A) != None));
 	return S;
 }
 
@@ -130,9 +161,12 @@ function Refresh()
 	local array<Actor> Pick;
 	local float D, BestD;
 	local int i, j, k, Best, Free;
-	local bool bKeep;
+	local bool bKeep, bNoWide, bNoTwin;
 	local string ClsName;
 
+	// tests: ?EnhOff=wide (the engine's own actors are not made always relevant) and ?EnhOff=twin (no twins): what each costs in traffic
+	bNoWide = EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).Off("wide");
+	bNoTwin = EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).Off("twin");
 	for (C = Level.ControllerList; C != None; C = C.NextController)
 	{
 		if (PlayerController(C) != None && C.Pawn != None)
@@ -169,10 +203,11 @@ function Refresh()
 	}
 	foreach DynamicActors(Class'Engine.Actor', A)
 	{
-		if (Part == 0 && A.RemoteRole > ROLE_None && !A.bAlwaysRelevant && !A.bStatic && !A.bDeleteMe && (A.DrawType == DT_Mesh || A.DrawType == DT_StaticMesh) && Controller(A) == None)
+		if (Part == 0 && !bNoWide && A.RemoteRole > ROLE_None && !A.bAlwaysRelevant && !A.bStatic && !A.bDeleteMe && (Pawn(A) != None || Mover(A) != None) && Controller(A) == None)
 		{
 			// the engine sends an actor to a client only while it can be seen from the client's viewpoint; enemies and objects around the players are
-			// wanted whether or not the wall in front of them hides them, so they are sent always while the players are near (see WideSet)
+			// wanted whether or not the wall in front of them hides them, so they are sent always while the players are near (see WideSet). Only creatures and moving
+			// constructions: every actor made always relevant has to be received and processed by the guest (~7 fps for the whole 3500-unit ball of props).
 			for (j = 0; j < Refs.Length; j++)
 			{
 				if (VSize(A.Location - Refs[j]) < 3500.0)
@@ -183,7 +218,7 @@ function Refresh()
 				}
 			}
 		}
-		if (!Twinnable(A))
+		if (bNoTwin || !Twinnable(A))
 		{
 			continue;
 		}
@@ -276,7 +311,13 @@ function Refresh()
 	{
 		if (SlotActor[i] != None)
 		{
-			Pos[i] = PosOf(SlotActor[i]);
+			// a creature (the gnats and dragonflies of the swamp: 13 of them, each record ~50 bytes) moves all the time, so its record changes at every look; the guest
+			// needs no more than a place to drift to, a record a second is enough (~2.6 KB/s of the host's ~2.7 KB/s were these records at four a second)
+			if (Pawn(SlotActor[i]) == None || Pos[i] == "" || Level.TimeSeconds - PosTime[i] >= 1.0)
+			{
+				Pos[i] = PosOf(SlotActor[i], i);
+				PosTime[i] = Level.TimeSeconds;
+			}
 		}
 	}
 }
@@ -290,6 +331,8 @@ simulated function KillTwin(int i)
 	Twin[i] = None;
 	TwinRec[i] = "";
 	TwinPos[i] = "";
+	Moving[i] = 0;
+	LastApply[i] = 0.0;
 }
 
 simulated function MakeTwin(int i)
@@ -383,6 +426,15 @@ simulated function ApplyPos(int i)
 	V.Y = float(Y);
 	V.Z = float(Z);
 	Target[i] = V;
+	if (LastApply[i] == 0.0)
+	{
+		Interval[i] = 1.0;
+	}
+	else
+	{
+		Interval[i] = FClamp(Level.TimeSeconds - LastApply[i], 0.2, 3.0);
+	}
+	LastApply[i] = Level.TimeSeconds;
 	if (TwinPos[i] == "" || VSize(T.Location - V) > 600.0)
 	{
 		T.SetLocation(V);
@@ -424,6 +476,46 @@ simulated function Rotator MakeRot(int Yaw)
 	return R;
 }
 
+// The pickups (coins, money bags, energy bars and kegs, potions of health) turn on the host: the stock script gives them Physics = PHYS_Rotating, a
+// rotation rate and a fixed direction when the level starts, and the server replicates them as dumb proxies (ROLE_DumbProxy): a dumb proxy is not
+// simulated on the client, which stayed at PHYS_None and never turned them. The way the engine means it (Replication Roles): the server makes them
+// simulated proxies (see Refresh), and the client, which gets the initial location, rotation and rate, runs the rotation itself; the angle need not be the
+// host's at every moment, only the place. A pickup on the client that has a rate and no physics is given PHYS_Rotating here.
+simulated function FixSpinners()
+{
+	local Pickup P;
+	local Rotator R;
+	local int N;
+
+	foreach DynamicActors(Class'Engine.Pickup', P)
+	{
+		if (P.Physics == PHYS_None && P.RotationRate.Yaw != 0 && P.bFixedRotationDir)
+		{
+			if (P.Rotation.Yaw == 0)
+			{
+				R = P.Rotation;
+				R.Yaw = int(Abs(P.Location.X * 7.0 + P.Location.Y * 13.0)) & 65535;   // the host gave every pickup its own start angle; the replicated one is zero
+				P.SetRotation(R);
+			}
+			P.Role = ROLE_SimulatedProxy;   // the client's own copy of a map actor keeps the class's role; only a simulated proxy is simulated
+			P.SetPhysics(PHYS_Rotating);
+			if (!bSpinWatching && SpinWatchRuns < 3 && Level.TimeSeconds - P.LastRenderTime < 1.0 && N < 5)
+			{
+				SpinWatch[N] = P;
+				SpinYaw0[N] = P.Rotation.Yaw & 65535;
+				N++;
+			}
+			SpinFixed++;
+		}
+	}
+	if (N > 0)
+	{
+		bSpinWatching = true;
+		SpinWatchClock = 0.0;
+		SpinWatchRuns++;
+	}
+}
+
 simulated event Tick(float DeltaTime)
 {
 	local int i;
@@ -433,12 +525,6 @@ simulated event Tick(float DeltaTime)
 	if (Role == ROLE_Authority)
 	{
 		Clock += DeltaTime;
-		StampClock += DeltaTime;
-		if (StampClock > 2.0)
-		{
-			StampClock = 0.0;
-			Stamp = (Stamp + 1) & 255;    // makes every record read different now and then, so a lost one is sent again
-		}
 		if (Clock >= 0.25)
 		{
 			Clock = 0.0;
@@ -446,36 +532,78 @@ simulated event Tick(float DeltaTime)
 		}
 		return;
 	}
-	Alpha = FMin(1.0, DeltaTime * 8.0);
-	for (i = 0; i < MaxTwins; i++)
+	if (bSpinWatching)
 	{
-		if (Rec[i] != TwinRec[i])
+		SpinWatchClock += DeltaTime;
+		if (SpinWatchClock >= 0.5)
 		{
-			KillTwin(i);
-			if (Rec[i] != "" && Pos[i] != "")
+			bSpinWatching = false;
+			for (i = 0; i < 5; i++)
+			{
+				if (SpinWatch[i] != None)
+				{
+					Log("[SPIN] check " $ string(SpinWatchRuns) $ ": " $ string(SpinWatch[i].Name) $ " yaw " $ string(SpinYaw0[i]) $ " -> " $ string(SpinWatch[i].Rotation.Yaw & 65535) $ " in " $ string(SpinWatchClock) $ " s, physics " $ string(int(SpinWatch[i].Physics)) $ " role " $ string(int(SpinWatch[i].Role)) $ " rendered " $ string(Level.TimeSeconds - SpinWatch[i].LastRenderTime) $ " s ago");
+					SpinWatch[i] = None;
+				}
+			}
+		}
+	}
+	SpinClock += DeltaTime;
+	if (SpinClock >= 1.0)
+	{
+		SpinClock = 0.0;
+		FixSpinners();
+	}
+	SlotClock += DeltaTime;
+	if (SlotClock >= 0.1)
+	{
+		SlotClock = 0.0;
+		for (i = 0; i < MaxTwins; i++)
+		{
+			if (Rec[i] == "" && Twin[i] == None)
+			{
+				continue;
+			}
+			if (Rec[i] != TwinRec[i])
+			{
+				KillTwin(i);
+				if (Rec[i] != "" && Pos[i] != "")
+				{
+					MakeTwin(i);
+				}
+				else
+				{
+					Tried[i] = "";
+				}
+			}
+			if (Twin[i] == None && Rec[i] != "" && Pos[i] != "" && Tried[i] != Rec[i])
 			{
 				MakeTwin(i);
 			}
-			else
-			{
-				Tried[i] = "";
-			}
-		}
-		if (Twin[i] == None && Rec[i] != "" && Pos[i] != "" && Tried[i] != Rec[i])
-		{
-			MakeTwin(i);
-		}
-		if (Twin[i] != None)
-		{
-			if (Pos[i] != TwinPos[i] && Pos[i] != "")
+			if (Twin[i] != None && Pos[i] != TwinPos[i] && Pos[i] != "")
 			{
 				ApplyPos(i);
 				TwinPos[i] = Pos[i];
+				if (VSize(Target[i] - Twin[i].Location) > 1.0)
+				{
+					Moving[i] = 1;
+				}
 			}
+		}
+	}
+	for (i = 0; i < MaxTwins; i++)
+	{
+		if (Moving[i] != 0 && Twin[i] != None)
+		{
+			Alpha = FMin(1.0, DeltaTime * 2.0 / FMax(Interval[i], 0.2));
 			D = Target[i] - Twin[i].Location;
 			if (VSize(D) > 1.0)
 			{
 				Twin[i].SetLocation(Twin[i].Location + D * Alpha);
+			}
+			else
+			{
+				Moving[i] = 0;
 			}
 		}
 	}

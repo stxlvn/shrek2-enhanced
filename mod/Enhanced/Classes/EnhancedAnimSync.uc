@@ -275,7 +275,7 @@ simulated function ProbeWorld()
 		}
 		S = "[WP] " $ string(A.Name) $ " cls=" $ string(A.Class.Name) $ " hid=" $ string(int(A.bHidden)) $ " dt=" $ string(int(A.DrawType)) $ " ph=" $ string(int(A.Physics)) $ " rr=" $ string(int(A.RemoteRole));
 		S = S $ " loc=" $ string(int(A.Location.X / 20.0)) $ "," $ string(int(A.Location.Y / 20.0)) $ "," $ string(int(A.Location.Z / 20.0));
-		S = S $ " yaw=" $ string((A.Rotation.Yaw & 65535) / 2048) $ " a0=" $ string(N0) $ " na=" $ string(Cnt) $ " lt=" $ string(int(A.LightType)) $ "/" $ string(int(A.LightBrightness)) $ Em;
+		S = S $ " yaw=" $ string((A.Rotation.Yaw & 65535) / 2048) $ " rate=" $ string(A.RotationRate.Yaw) $ " fix=" $ string(int(A.bFixedRotationDir)) $ " a0=" $ string(N0) $ " na=" $ string(Cnt) $ " lt=" $ string(int(A.LightType)) $ "/" $ string(int(A.LightBrightness)) $ Em;
 		if (Mover(A) != None)
 		{
 			S = S $ " key=" $ string(Mover(A).KeyNum);
@@ -657,5 +657,6 @@ defaultproperties
 	bAlwaysRelevant=True
 	bHidden=True
 	NetUpdateFrequency=30.0
+	NetPriority=3.0
 	DrawType=DT_None
 }

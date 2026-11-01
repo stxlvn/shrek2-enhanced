@@ -37,6 +37,10 @@ function SameAsBase($why) { $d = TreeDiff $base (Snap); Assert ($d.Count -eq 0) 
 try {
     Run @('/silent', '/dir', $game, '/uninstall')     # the test copy may be left installed by an earlier test
     Assert ($code -eq 0) 'leftover state removed'
+    # a Cyrillic name in a UTF-16 User.ini (the game writes it that way) must survive the install and come back byte for byte
+    $ui = "$docs\Shrek 2\User.ini"
+    $nameRu = -join ([char[]](0x41F, 0x440, 0x438, 0x432, 0x435, 0x442))
+    [IO.File]::WriteAllText($ui, [IO.File]::ReadAllText($ui) + "`r`n[EncTest]`r`nName=$nameRu`r`n", [Text.Encoding]::Unicode)
     $base = Snap
     "baseline: $($base.Count) files"
 
@@ -50,6 +54,9 @@ try {
 
     # install, install again, remove
     Run @('/silent', '/dir', $game, '/textures', 'ru'); Assert ($code -eq 0) 'install'
+    $ub = [IO.File]::ReadAllBytes($ui)
+    Assert (($ub[0] -eq 0xFF) -and ($ub[1] -eq 0xFE)) 'User.ini is still UTF-16 after the install'
+    Assert ([IO.File]::ReadAllText($ui).Contains($nameRu)) 'the Cyrillic name is still in User.ini'
     $inst = Snap
     Run @('/silent', '/dir', $game, '/textures', 'ru'); Assert ($code -eq 0) 'second install'
     Assert ((TreeDiff $inst (Snap)).Count -eq 0) 'second install changes nothing'

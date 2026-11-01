@@ -1,0 +1,7 @@
+LIBRARY dinput8
+EXPORTS
+  DirectInput8Create=q_DirectInput8Create @1
+  DllCanUnloadNow=q_DllCanUnloadNow @2
+  DllGetClassObject=q_DllGetClassObject @3
+  DllRegisterServer=q_DllRegisterServer @4
+  DllUnregisterServer=q_DllUnregisterServer @5

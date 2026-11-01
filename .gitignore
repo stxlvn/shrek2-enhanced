@@ -1,0 +1,15 @@
+build/
+*.exe
+*.dll
+*.u
+*.utx
+*.tfc
+*.zip
+*.7z
+*.log
+*.bmp
+*.png
+*.enhanced-backup
+*.enhanced-tmp*
+.enhanced-txn-*
+__pycache__/

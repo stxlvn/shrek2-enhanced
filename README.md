@@ -73,4 +73,4 @@ This mod was built with the playbook of the [Co-op Anything](https://github.com/
 
 ## License
 
-None chosen yet. Until one is added, all rights are reserved by the author.
+[MIT](LICENSE). It covers the code in this repository only. Shrek 2, its assets and names belong to their owners; no game content is included here.

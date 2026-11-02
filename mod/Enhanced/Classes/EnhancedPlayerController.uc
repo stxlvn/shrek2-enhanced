@@ -45,7 +45,9 @@ var Vector LastCamLoc;
 var Rotator LastCamRot;
 var string SubText, SubName;
 var Color SubColor;            // the speaker's colour   // the host's subtitle during a cutscene (set by the server)
-var bool bCutView;            // the host is in a cutscene: this guest's picture is the host's camera (set by the server every frame)
+var bool bCutView;            // the host is in a cutscene: this guest's picture is the host's camera (a reliable RPC carries mode changes)
+var bool bCutViewSent;        // server: the last mode sent by ClientCutView; the pose below remains unreliable
+var bool bCutViewSentInit;
 var Vector CutLoc;
 var Rotator CutRot;
 var int CutYaw, CutPitch, CutRoll;   // the angles again as whole numbers: a replicated Rotator is sent in steps of 256 units (1.4 degrees), a slow pan came out in jerks
@@ -314,13 +316,28 @@ event PreClientTravel()
 replication
 {
 	reliable if (Role == ROLE_Authority)
-		GateNote, DownNote, SubText, SubName, SubColor, HudCoins, HudPotions, HudPotionSel, HudIcons;
+		ClientCutView, GateNote, DownNote, SubText, SubName, SubColor, HudCoins, HudPotions, HudPotionSel, HudIcons;
 	reliable if (Role < ROLE_Authority)
 		ServerAction, ServerSetReady;
 	unreliable if (Role == ROLE_Authority && bNetOwner)
-		bCutView, CutLoc, CutYaw, CutPitch, CutRoll, CutFov;
+		CutLoc, CutYaw, CutPitch, CutRoll, CutFov;
 	unreliable if (Role < ROLE_Authority)
 		ServerSetView;
+}
+
+simulated function ClientCutView(bool bOn)
+{
+	if (bCutView == bOn)
+	{
+		return;
+	}
+	bCutView = bOn;
+	bCutInit = false;
+	LastCutTime = Level.TimeSeconds;
+	if (bTestShots)
+	{
+		Log("[CUTSYNC] mode=" $ string(bOn));
+	}
 }
 
 function ServerSetReady(bool bOn)

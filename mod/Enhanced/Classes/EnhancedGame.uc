@@ -3973,6 +3973,7 @@ function ChaseRotation(PlayerController Host)
 function MirrorOne()
 {
 	local PlayerController Host;
+	local EnhancedPlayerController Guest;
 	local Actor VA;
 	local Vector Loc;
 	local Rotator Rot;
@@ -3987,12 +3988,15 @@ function MirrorOne()
 	{
 		return;
 	}
+	Guest = EnhancedPlayerController(PendingPC);
 	bFree = Host.Pawn != None;
 	if (bFree && P2Pawn != None && !bP2Hidden)
 	{
-		if (EnhancedPlayerController(PendingPC) != None)
+		if (Guest != None && (!Guest.bCutViewSentInit || Guest.bCutViewSent))
 		{
-			EnhancedPlayerController(PendingPC).bCutView = false;
+			Guest.bCutViewSentInit = true;
+			Guest.bCutViewSent = false;
+			Guest.ClientCutView(false);
 		}
 		return;
 	}
@@ -4007,20 +4011,25 @@ function MirrorOne()
 	Host.PlayerCalcView(VA, Loc, Rot);
 	CutCam.SetLocation(Loc);
 	CutCam.SetRotation(Rot);
-	if (EnhancedPlayerController(PendingPC) != None)
+	if (Guest != None)
 	{
-		EnhancedPlayerController(PendingPC).bCutView = true;
-		EnhancedPlayerController(PendingPC).CutLoc = Loc;
-		EnhancedPlayerController(PendingPC).CutYaw = Rot.Yaw;
-		EnhancedPlayerController(PendingPC).CutPitch = Rot.Pitch;
-		EnhancedPlayerController(PendingPC).CutRoll = Rot.Roll;
+		if (!Guest.bCutViewSentInit || !Guest.bCutViewSent)
+		{
+			Guest.bCutViewSentInit = true;
+			Guest.bCutViewSent = true;
+			Guest.ClientCutView(true);
+		}
+		Guest.CutLoc = Loc;
+		Guest.CutYaw = Rot.Yaw;
+		Guest.CutPitch = Rot.Pitch;
+		Guest.CutRoll = Rot.Roll;
 		if (EnhancedHeroController(Host) != None && EnhancedHeroController(Host).bFovScaled)
 		{
-			EnhancedPlayerController(PendingPC).CutFov = EnhancedHeroController(Host).LogicalFov;
+			Guest.CutFov = EnhancedHeroController(Host).LogicalFov;
 		}
 		else
 		{
-			EnhancedPlayerController(PendingPC).CutFov = Host.FovAngle;
+			Guest.CutFov = Host.FovAngle;
 		}
 	}
 	if (bJitterOpt)

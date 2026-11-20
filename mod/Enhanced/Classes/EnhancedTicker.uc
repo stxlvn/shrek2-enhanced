@@ -35,6 +35,15 @@ event Tick(float DeltaTime)
 		FpsTime = 0.0;
 		FpsFrames = 0;
 	}
+	// it ticks also while the world is paused (bAlwaysTick): then only the wait for the guests in their opening runs (it ends the pause)
+	if (G != None)
+	{
+		G.IntroWaitTick(DeltaTime);
+	}
+	if (Level.Pauser != None)
+	{
+		return;
+	}
 	if (G != None)
 	{
 		if (!G.Off("smooth"))
@@ -50,6 +59,7 @@ event Tick(float DeltaTime)
 			G.SyncSubs();
 		}
 		G.GateTick(DeltaTime);
+		G.HostCameraWatch();
 		G.GateTestTick(DeltaTime);
 		G.ShowHostNote();
 		G.DownFreeze();
@@ -98,4 +108,5 @@ defaultproperties
 {
 	bHidden=True
 	RemoteRole=ROLE_None
+	bAlwaysTick=True
 }

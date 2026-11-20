@@ -2,6 +2,8 @@
 
 A co-op mod for **Shrek 2 (PC, 2004)**, the Russian 1C edition (Unreal Engine 2.5). Players join a game from the book menu (LAN search, direct address or UPnP over the Internet), share the level and its checkpoints, and see each other's characters and animations. The mod also adds a Hor+ field of view, a resolution list, a rearranged HUD, co-op saves, and optional English and HD textures built from your own copy of the HD pack.
 
+A level's opening cutscene plays on every player's own machine as in the single-player game; a guest joins the host's world when his is over, and the host's world waits, paused, for a guest who is still watching.
+
 Status: beta. It is tested with scripted bots and a second game window; play over the Internet between real people has had little testing.
 
 This repository holds **sources only**. It does not contain game files, textures, audio, the HD pack, the Level Editor, the Shrek title font, or any compiled binary. The game's own packages are never modified except as described under "What the setup changes".
@@ -14,7 +16,7 @@ This repository holds **sources only**. It does not contain game files, textures
 | `mod/IpDrv/Classes` | the sockets package the mod's UPnP and LAN code uses (`IpDrv.u`) |
 | `mod/Localization` | `Enhanced.int` and `Enhanced.Rus` (UTF-16): mod texts and the speaker table |
 | `mod/Obs/Classes` | a test-only mutator that measures the stock game's jump; not shipped |
-| `native/` | the engine layer, a Direct3D 8 proxy (`d3d8.dll`): animation sync natives, hardware tuning, prefetch, anti-aliasing, menu cursor scale |
+| `native/` | the engine layer, a Direct3D 8 proxy (`d3d8.dll`): animation sync natives, the "several heroes" hook (enemies, traps, pickups and bosses see the player nearest to them, not only the host), music changes sent to guests, the skipped loading screen of a client, hardware tuning, prefetch, anti-aliasing, menu cursor scale |
 | `installer/` | the setup program (WinForms, C#): patches, backups, transactional install with rollback, removal |
 | `tools/` | `patch_engine.py` (the `Engine.dll` patch the setup applies in C#), and three test-rig proxies: `shfolder` (redirects My Documents), `quiet` (windows that never take focus), `mutexfix` (two game copies at once) |
 | `tests/` | installer tests that run on a scratch copy of a game |
@@ -66,6 +68,10 @@ Test a copy of the game, never your own install: a game started without the My D
 - No game assets in the repository. English and HD textures are made on your PC from your own files (the setup applies hash-checked patches, or reads your own copy of the HD pack).
 - The Shrek title font is not shipped. If you put `Shrekrusbyme.ttf` into `System`, the headings use it; otherwise Tahoma.
 - No anti-cheat bypass, nothing that touches other people's multiplayer games.
+
+## Credits
+
+Four gameplay fixes follow MPatcher from Master_64's MPak (Shrek 2.2): the Steed's double jump of 128 on every level, Puss in Boots surviving falls up to 1000 units everywhere, the smaller hit cylinder of swinging stones and spiked balls, and the heroes' health and the level's projectors after loading a save. They are written anew in `EnhancedGame` (`HeroTweaks`, `FixSwings`, `PreSaveGame`, `PostLoadGame`).
 
 ## Part of Co-op Anything
 

@@ -146,6 +146,53 @@ var float JitterClock;
 var bool bResListDone;               // the resolution list of the Settings page has been filled
 var float NoteTime;
 var string GateNoteHost;              // what the host's HUD shows while he waits at a gate
+var string LeashNoteHost;             // what the host's HUD shows while he is too far from the others (the seconds before he is brought back)
+var PlayerController LeashWarned;     // the player who has the leash note now
+var Vector LeashStart;                // the start of the level (the leash's anchor before the first checkpoint)
+var int LeashStartState;              // 0 = not looked up yet, 1 = found, 2 = none
+var array<KWCutScene> CutList;        // the level's cutscenes (made by its CutFactory at the start; looked up again now and then)
+var float CutListAt;
+var KWCutScene ActiveCut;             // the host's cutscene that is playing now
+var float ActiveCutStart;
+var int CutSerial;                    // a number for every cutscene the host plays (the guests answer with it)
+var bool bHeroInit;                   // the engine layer's several-heroes hook has been set up for this level (see HeroTick)
+var int HeroInitOk;
+var Actor BossNow;                    // the boss every hero has as aBoss (MirrorBoss)
+var string HopMode, HopMap, HopHost;   // a stop in the menu book on the way between two copies of the same level (see Hop)
+var bool bHopGone;
+var string IntroOnlyHost;              // a guest playing the level's opening by himself first (URL option EnhIntroOnly=<host address>): he joins the host after it
+var bool bIntroSeen;                    // ... the opening began on this machine
+var float IntroQuietSince;
+var bool bIntroJoining;
+var bool bLevelHadOpening;               // host: this level played an opening cutscene when it started (a guest who comes in later plays it by himself first)
+var int OpeningSerial;                   // host: the number of that opening (CutSerial)
+var bool bLocalCutOpt;                   // URL option EnhLocalCut: the guests rebuild the host's cutscenes in the middle of a level on their machines (off: the host's camera)
+var array<string> AwayForIntro;          // host: the guests sent away to play the opening by themselves (their leaving asks nothing)
+var array<string> IntroWait;             // host: the guests still playing this level's opening in their own game; the world waits for them (IntroWaitTick)
+var float IntroWaitClock;                // host: seconds (frames, also while paused) since the last guest went away for an opening
+var bool bIntroPaused;                   // host: the world is paused by IntroWaitTick
+var float IntroPausedAt;                 // host: IntroWaitClock when that pause began
+var bool bIntroShot;                     // tests (EnhShot): one picture of the waiting host is taken
+var string IntroWaitNote;                // host: the note on the host's HUD while the world waits (EnhancedHud draws it)
+var float TweakAt;                       // next time HeroTweaks runs
+var array<Pawn> SavedHeroes;             // stock save game (PreSaveGame): the heroes and their health, put back after the load (MPatcher's fix)
+var array<string> SavedHealth;
+var float SaveTestAt;                    // tests (?EnhSaveTest=<s>): a stock save at that time with the hero's health at 37, then the load of it
+var bool bSaveTestDone;                  // ... kept in the save: the loaded game does not start it again
+var transient float SaveTestLoadAt;      // ... not kept in the save (transient): the load happens once
+var float SaveTestShotAt;
+var array<string> OpeningMaps;           // levels that start with an opening cutscene (the guests play it by themselves before they join)
+var array<string> IntroEnd;              // per level: where the host's hero stands when the level's opening is over ("map=x,y,z", measured by the join survey)
+var bool bPullAfterCut;                 // the host's cutscene is over: guests who came into the world early and stand far away are brought to him
+var Vector CutStartHeroLoc;            // where the host's hero stood when the host's cutscene began (HostPlace)
+var bool bCutStartLoc;
+var Pawn LastHostHero;                // the host's hero as last seen with the host's controller (see HostHero)
+var float HeroStatsAt, HeroSanityAt;
+var string HostSongCmd;               // the host's song now (the last music change that started one), for a guest who comes in or comes back from his cutscene
+var int HostSongHandle;
+var int MusicLogs;
+var float HudExtraAt;
+var string HudExtraNow;
 var string GateTestMode;              // URL option EnhGateTest: a script that walks the players to the first gate (tests)
 var float GateTestClock;
 var int GateTestStep;
@@ -174,6 +221,16 @@ native(3500) final function int EnhNativeVersion();
 native(3510) final function int EnhHwInfo(int What);
 native(3503) final function EnhDrawOffset(int Slot, Actor A, float X, float Y);
 native(3504) final function int EnhPrePivotCalib(Actor A);
+native(3530) final function int EnhHeroInit(Actor Probe, float X, float Y, float Z, Controller C, Pawn P);
+native(3531) final function EnhHeroClear();
+native(3532) final function EnhHeroAdd(Actor Hero);
+native(3533) final function EnhHeroOwner(Object O, Actor Hero);
+native(3534) final function int EnhHeroStats();
+native(3535) final function EnhDeaf(PlayerController PC, int On);
+native(3541) final function int EnhHeroHost(string Path);
+native(3542) final function EnhNetClient(int On);
+native(3536) final function EnhMusicWatch(int On);
+native(3537) final function string EnhMusicPoll();
 
 // The effects and creatures the level places for itself (torches, pollen, fire, the gnats) are not replicated: the server sends nothing of them and the client
 // has to bring its own copies from the map file, but a client throws away every placed actor that is not "no delete" and not replicated, and these classes
@@ -197,6 +254,14 @@ event InitGame(string Options, out string Error)
 	PatchWorldDefaults(self);
 	AddMutator("Enhanced.EnhancedMutator", true);
 	bSkipIntroOpt = ParseOption(Options, "EnhSkipIntro") != "";
+	EnhNetClient(0);     // a level of this machine's own: its loading screens are drawn again
+	IntroOnlyHost = ParseOption(Options, "EnhIntroOnly");
+	HopMode = ParseOption(Options, "EnhHop");
+	HopMap = ParseOption(Options, "EnhHopMap");
+	HopHost = ParseOption(Options, "EnhHopHost");
+	bLocalCutOpt = ParseOption(Options, "EnhLocalCut") != "";
+	ReadAway(ParseOption(Options, "EnhAway"));
+	SaveTestAt = float(ParseOption(Options, "EnhSaveTest"));
 	bNoRingOpt = ParseOption(Options, "EnhNoRing") != "";
 	bPivotTest = ParseOption(Options, "EnhPivotTest") != "";
 	bFpsOpt = ParseOption(Options, "EnhFps") != "";
@@ -323,6 +388,13 @@ event PostBeginPlay()
 // kept following the hero, the book was behind it and the menu showed only the wooden board (while the world went on and the HUD stayed hidden).
 function bool SetPause(bool bPause, PlayerController P)
 {
+	// a test guest alone in his opening (scripted input or pictures): the stock pause of a minimised window (ShrekController.ShowMininized) held his
+	// opening for good, the test window is never restored (run lc9: the host waited 240 s). A player's own window pauses as in the stock game.
+	if (IntroOnlyHost != "" && bPause && (Class'Enhanced.EnhancedPlayerController'.default.bTestBot || Class'Enhanced.EnhancedPlayerController'.default.bTestShots))
+	{
+		Log("[SDBG] Enhanced: pause request ignored in a test guest's opening");
+		return false;
+	}
 	if ((Level.NetMode == NM_Standalone && !Off("nopause")) || Off("allowpause"))   // nopause: tests (the quiet test windows are never focused and the engine pauses them)
 	{
 		return Super.SetPause(bPause, P);
@@ -398,6 +470,1029 @@ function EnsureAnimSync()
 		}
 		T("world sync: " $ string(WorldSync[0]) $ " x 4");
 	}
+}
+
+// ---- The host's music for the guests ----
+// Music plays on the machine whose script calls PlayMusic: every change of the level's music (a fight, a potion, a trigger) was heard by the host only.
+// The engine layer watches the host's audio (enhnative.c "The host's music") and every change goes to the guests, except to one who plays his own
+// cutscene (it has its own music; he gets the host's song when he is back, see SendHostSong). ?EnhOff=music switches it off.
+function MusicTick()
+{
+	local string S, R;
+	local int i, Kind, Handle;
+
+	if (Off("music") || Level.NetMode != NM_ListenServer || IsMenuLevel())
+	{
+		return;
+	}
+	if (GPC.Length == 0)
+	{
+		EnhMusicWatch(0);
+		return;
+	}
+	EnhMusicWatch(1);
+	for (i = 0; i < 8; i++)
+	{
+		S = EnhMusicPoll();
+		if (S == "")
+		{
+			break;
+		}
+		R = S;
+		Kind = int(NextBar(R));
+		Handle = int(NextBar(R));
+		if (Kind == 1)
+		{
+			HostSongCmd = S;
+			HostSongHandle = Handle;
+		}
+		else if (Kind == 3 || (Kind == 2 && Handle == HostSongHandle))
+		{
+			HostSongCmd = "";
+		}
+		if (MusicLogs < 30)
+		{
+			MusicLogs++;
+			T("music: " $ S);
+		}
+		SendMusic(S);
+	}
+}
+
+function string NextBar(out string S)
+{
+	local int P;
+	local string R;
+
+	P = InStr(S, "|");
+	if (P < 0)
+	{
+		R = S;
+		S = "";
+		return R;
+	}
+	R = Left(S, P);
+	S = Mid(S, P + 1);
+	return R;
+}
+
+function SendMusic(string S)
+{
+	local int i;
+	local EnhancedPlayerController PC;
+
+	for (i = 0; i < GPC.Length; i++)
+	{
+		PC = EnhancedPlayerController(GPC[i]);
+		if (PC != None && !PC.bLocalCutBusy)
+		{
+			PC.ClientMusic(S);
+		}
+	}
+}
+
+// the host's song now, for one guest (he came in, or came back from his own cutscene)
+function SendHostSong(EnhancedPlayerController PC)
+{
+	if (PC == None || Off("music"))
+	{
+		return;
+	}
+	PC.ClientMusic("3|0|0.5|0|");
+	if (HostSongCmd != "")
+	{
+		PC.ClientMusic(HostSongCmd);
+	}
+}
+
+// ---- Several heroes ----
+// The stock game reads LevelInfo.PlayerHeroActor, the host's hero, in about 1400 places: enemies fight only him, traps, fairies, pick-ups, bosses and
+// triggers know only him, and the guests were invisible to all of it. The engine layer now answers that read with the hero who belongs to the code
+// asking (the nearest hero for an enemy or a trap, the player's own hero for his controller, HUD and camera; see enhnative.c "Several heroes"). Here the
+// lists are filled every frame: the heroes that can be fought (on their feet, not hidden) and the objects that belong to a player. Nothing is listed while
+// the host plays alone, so a single-player game reads the real value everywhere. ?EnhOff=heroes switches it off.
+function HeroTick()
+{
+	local PlayerController Host;
+	local EnhancedCam Probe;
+	local KWPawn P;
+	local int i, n;
+
+	if (Off("heroes") || Level.NetMode != NM_ListenServer || IsMenuLevel())
+	{
+		return;
+	}
+	Host = HostController();
+	if (!bHeroInit && Host != None && Host.Pawn != None)
+	{
+		bHeroInit = true;
+		Probe = Spawn(Class'Enhanced.EnhancedCam',,, Host.Pawn.Location + vect(0.0, 0.0, 300.0));
+		if (Probe != None)
+		{
+			HeroInitOk = EnhHeroInit(Probe, Probe.Location.X, Probe.Location.Y, Probe.Location.Z, Host, Host.Pawn);
+			Probe.Destroy();
+		}
+		if (HeroInitOk == 1)
+		{
+			HeroHostList();
+		}
+		T("several heroes: engine hook " $ string(HeroInitOk == 1));
+	}
+	EnhHeroClear();
+	// while the host's hero is in a cutscene (the cutscene's controller has him, the host's controller has no pawn) every read gets the real value, as in
+	// the stock game: the creatures and enemies check "is the hero in a cutscene" through it
+	if (HeroInitOk != 1 || GPC.Length == 0 || Host == None || Host.Pawn == None)
+	{
+		return;
+	}
+	// what belongs to the host: his controller, his HUD, his camera and its target; and the game itself and the level (the stock
+	// KWGame.GetHeroController finds "the" hero controller through Level.PlayerHeroActor, and 63 places rely on it being the host's)
+	EnhHeroOwner(Self, Host.Pawn);
+	EnhHeroOwner(Level, Host.Pawn);
+	EnhHeroOwner(Host, Host.Pawn);
+	EnhHeroOwner(Host.myHUD, Host.Pawn);
+	if (KWHeroController(Host) != None && KWHeroController(Host).Camera != None)
+	{
+		EnhHeroOwner(KWHeroController(Host).Camera, Host.Pawn);
+		EnhHeroOwner(KWHeroController(Host).Camera.CamTarget, Host.Pawn);
+	}
+	if (HeroUsable(Host.Pawn))
+	{
+		EnhHeroAdd(Host.Pawn);
+		n++;
+	}
+	for (i = 0; i < GPC.Length; i++)
+	{
+		P = None;
+		if (i < GPawn.Length)
+		{
+			P = GPawn[i];
+		}
+		if (GPC[i] != None)
+		{
+			EnhHeroOwner(GPC[i], P);
+		}
+		if (HeroUsable(P))
+		{
+			EnhHeroAdd(P);
+			n++;
+		}
+	}
+	if (Level.TimeSeconds - HeroStatsAt > 20.0)
+	{
+		HeroStatsAt = Level.TimeSeconds;
+		T("several heroes: " $ string(n) $ " heroes listed, " $ string(EnhHeroStats()) $ " reads answered with another hero since the last line");
+	}
+	MirrorBoss(Host);
+	if (Level.TimeSeconds - HeroSanityAt > 1.0)
+	{
+		HeroSanityAt = Level.TimeSeconds;
+		RecountCombatants(Host);
+	}
+}
+
+// A boss knows the heroes through KWPawn.aBoss, which the stock game sets on its one hero (the boss trigger, the boss meter) and clears there when the
+// boss is beaten. With several heroes it was set on one of them only, and the bosses (BossFGM.WhatToDo, BossPib.WhatToDo, the bandit and fat knight
+// controllers) stood idle while a hero without it was the nearest. Every hero gets the same boss: a change on any of them (set or cleared) goes to all.
+function MirrorBoss(PlayerController Host)
+{
+	local int i;
+	local Actor Cur;
+	local KWPawn H;
+
+	Cur = BossNow;
+	for (i = -1; i < GPawn.Length; i++)
+	{
+		if (i < 0)
+		{
+			H = KWPawn(Host.Pawn);
+		}
+		else
+		{
+			H = GPawn[i];
+		}
+		if (H != None && H.aBoss != BossNow)
+		{
+			Cur = H.aBoss;
+			break;
+		}
+	}
+	if (Cur != None && Cur.bDeleteMe)
+	{
+		Cur = None;
+	}
+	if (Cur != BossNow)
+	{
+		T("boss: " $ string(BossNow) $ " -> " $ string(Cur) $ " for every hero");
+	}
+	BossNow = Cur;
+	for (i = -1; i < GPawn.Length; i++)
+	{
+		if (i < 0)
+		{
+			H = KWPawn(Host.Pawn);
+		}
+		else
+		{
+			H = GPawn[i];
+		}
+		if (H != None && H.aBoss != BossNow)
+		{
+			H.aBoss = KWPawn(BossNow);
+		}
+	}
+}
+
+// Each hero counts the enemies fighting him (numCombatants: the stock limit of how many attack at once, 2). An enemy counts itself in on the hero it
+// fights and out on whichever hero is the nearest when it stops; with several heroes one count grew for good and every enemy aiming at that hero went to
+// cheer instead (CombatController.TooManyCombatants). The counts are made again every second: the enemies coming at or fighting a hero, by the nearest hero.
+function RecountCombatants(PlayerController Host)
+{
+	local Controller C;
+	local array<Pawn> Heroes;
+	local array<int> Count;
+	local int i, Best;
+	local float D, BestD;
+
+	if (HeroUsable(Host.Pawn))
+	{
+		Heroes[Heroes.Length] = Host.Pawn;
+	}
+	for (i = 0; i < GPawn.Length; i++)
+	{
+		if (HeroUsable(GPawn[i]))
+		{
+			Heroes[Heroes.Length] = GPawn[i];
+		}
+	}
+	if (Heroes.Length < 2)
+	{
+		return;
+	}
+	Count.Length = Heroes.Length;
+	for (C = Level.ControllerList; C != None; C = C.NextController)
+	{
+		if (C.Pawn == None || !C.Pawn.IsA('ShEnemy') || !(C.IsInState('MoveTowardHero') || C.IsInState('AttackHero') || C.IsInState('MoveTowardPile')))
+		{
+			continue;
+		}
+		Best = -1;
+		for (i = 0; i < Heroes.Length; i++)
+		{
+			D = VSize(Heroes[i].Location - C.Pawn.Location);
+			if (Best < 0 || D < BestD)
+			{
+				Best = i;
+				BestD = D;
+			}
+		}
+		Count[Best] = Count[Best] + 1;
+	}
+	for (i = 0; i < Heroes.Length; i++)
+	{
+		if (Heroes[i].GetPropertyText("numCombatants") != "" && int(Heroes[i].GetPropertyText("numCombatants")) != Count[i])
+		{
+			Heroes[i].SetPropertyText("numCombatants", string(Count[i]));
+		}
+	}
+}
+
+// The stock code that reads the hero only to reach the host's controller, HUD, camera, menus, movies or the shared purse keeps reading the host's
+// hero under the several-heroes hook (classes first, then functions). Made by tools/hostfuncs.py from the decompiled scripts (the functions that use
+// the hero only through .Controller or the HUD), plus the mixed ones decided by hand: the boss meter (the host's HUD shows it, the mod mirrors it to the
+// guests), the potions' effects, movies, the purse (coins and money bags, the bonus-coin count), potion and poster pick-ups (the host's menus).
+// Then from the review of every read (local/scratch/audit/review-heroes.md): the save points and fairies (a save through a guest's hero saved nothing and
+// used the fairy up), the bonus coin game (its end timer went to a guest's missing HUD: players were stuck in the bonus level), the potions, the shops,
+// the companions and their talk, movies, credits, the cutscene objects and the cutscene exit command that switches the host's hero.
+function HeroHostList()
+{
+	EnhHeroHost("KWGame.KWHudItem");
+	EnhHeroHost("KWGame.SavePoint");
+	EnhHeroHost("SHGame.SHSavePoint");
+	EnhHeroHost("SHGame.SavePointFairy");
+	EnhHeroHost("SHGame.SavePointFairycontroller");
+	EnhHeroHost("SHGame.SaveTimer");
+	EnhHeroHost("SHGame.bonusLevelTransferTimer");
+	EnhHeroHost("SHGame.SHSmartStart");
+	EnhHeroHost("SHGame.CoinBonusGame");
+	EnhHeroHost("SHGame.PotionBottles");
+	EnhHeroHost("SHGame.ThrownPotion");
+	EnhHeroHost("SHGame.PotionTimer");
+	EnhHeroHost("SHGame.StaySmallTrigger");
+	EnhHeroHost("SHGame.StrengthPotionMgr");
+	EnhHeroHost("SHGame.BumpLineSpeaker");
+	EnhHeroHost("SHGame.DriveThrough");
+	EnhHeroHost("SHGame.SlotMachine");
+	EnhHeroHost("SHGame.VendingWitchcontroller");
+	EnhHeroHost("SHGame.SHCompanionController");
+	EnhHeroHost("KWGame.CompanionCombatManager");
+	EnhHeroHost("KWGame.KWInterestManager");
+	EnhHeroHost("KWGame.ResolutionBasedMovieTrigger");
+	EnhHeroHost("SHGame.CreditsTrigger");
+	EnhHeroHost("SHGame.SHMenuBook");
+	EnhHeroHost("SHGame.CrossHairActor");
+	EnhHeroHost("KWGame.KWCutScene");
+	EnhHeroHost("KWGame.KWCutController");
+	EnhHeroHost("KWGame.KWPawn.OnCutExitCommand");
+	EnhHeroHost("SHGame.Shrek.PostLoadGame");
+	EnhHeroHost("KWGame.KWAIController.DoBumpLine");
+	EnhHeroHost("KWGame.KWAIController.DoingBumpLine.Timer");
+	EnhHeroHost("KWGame.KWHud");
+	EnhHeroHost("KWGame.BaseCam");
+	EnhHeroHost("KWGame.BaseCamTarget");
+	EnhHeroHost("KWGame.SelectCursor");
+	EnhHeroHost("KWGame.FadeViewDelegate");
+	EnhHeroHost("KWGame.FOVController");
+	EnhHeroHost("KWGame.MovieTrigger");
+	EnhHeroHost("SHGame.SHMovieManager");
+	EnhHeroHost("KWGame.PopupTrigger");
+	EnhHeroHost("KWGame.KWMiniGame");
+	EnhHeroHost("KWGame.KWHeroController.StopMoviePlayback");
+	EnhHeroHost("KWGame.KWHeroController.EscHandler");
+	EnhHeroHost("KWGame.KWMiniGame.AddScore");
+	EnhHeroHost("KWGame.KWMiniGame.WaitingForMiniGameStart.InitMiniGame");
+	EnhHeroHost("KWGame.KWMiniGame.PlayingMiniGame.BeginState");
+	EnhHeroHost("KWGame.KWMiniGame.EndMiniGame.BeginState");
+	EnhHeroHost("KWGame.KWPawn.KWGetWorldLoc");
+	EnhHeroHost("KWGame.MovieTrigger.Activate");
+	EnhHeroHost("KWGame.PopupTrigger.StatePopUp.Tick");
+	EnhHeroHost("KWGame.TelePit.Activate");
+	EnhHeroHost("KWGame.TelePit.stateFadeIn.BeginState");
+	EnhHeroHost("KWGame.TelePit.stateFadeIn.EndState");
+	EnhHeroHost("SHGame.AppleTree.ShakeTheGround");
+	EnhHeroHost("SHGame.Batcontroller.AvoidActor.FlyFromActor");
+	EnhHeroHost("SHGame.CatapultController.LaunchCatapult.CatapultLaunchRelease");
+	EnhHeroHost("SHGame.CoinBonusGame.WaitforGameStart.Tick");
+	EnhHeroHost("SHGame.CoinBonusGame.PlayMiniGame.Timer");
+	EnhHeroHost("SHGame.CreditsTrigger.Activate");
+	EnhHeroHost("SHGame.DriveThrough.ActivateVendor");
+	EnhHeroHost("SHGame.DriveThrough.DriveThroughIdle.Timer");
+	EnhHeroHost("SHGame.HudItemPotion.GetCount");
+	EnhHeroHost("SHGame.HudItemPotion.DrawHudItem");
+	EnhHeroHost("SHGame.PotionTimer.WaitforGameStart.Tick");
+	EnhHeroHost("SHGame.PotionTimer.PlayMiniGame.Timer");
+	EnhHeroHost("SHGame.SHHudItem.DrawCount");
+	EnhHeroHost("SHGame.SHHudPotionTimer.PostLoadGame");
+	EnhHeroHost("SHGame.SHHudPotionTimer.SHHudTimerActive.Tick");
+	EnhHeroHost("SHGame.SHMenuBook.OpenBook");
+	EnhHeroHost("SHGame.SHSavePoint.OnSaveGame");
+	EnhHeroHost("SHGame.ShHeroPawn.TravelPreAccept");
+	EnhHeroHost("SHGame.SlotMachine.TakeDamage");
+	EnhHeroHost("SHGame.SlotMachine.SlotMachineInactive");
+	EnhHeroHost("SHGame.SlotMachine.SlotMashineAccept.ShowSlotMachineAcceptanceMenu");
+	EnhHeroHost("SHGame.SlotMachine.SlotMachineTakeCoins.CoinWorldLocationFromScreen");
+	EnhHeroHost("SHGame.SlotMachine.SlotMachineTakeCoins.Tick");
+	EnhHeroHost("SHGame.StaySmallTrigger.Activate");
+	EnhHeroHost("SHGame.ThrownPotion.BlowUp");
+	EnhHeroHost("SHGame.VendingWitchcontroller.WonSpin");
+	EnhHeroHost("Engine.Actor.CM");
+	EnhHeroHost("Engine.NavigationPoint.DrawLines");
+	EnhHeroHost("SHGame.EnemyBoss.StartBossMeter");
+	EnhHeroHost("SHGame.EnemyBoss.StopBossMeter");
+	EnhHeroHost("SHGame.PotionBottles.BlowUp");
+	EnhHeroHost("SHGame.SHMovieManager.Trigger");
+	EnhHeroHost("KWGame.ResolutionBasedMovieTrigger.Activate");
+	EnhHeroHost("SHGame.Coin.AnnouncePickup");
+	EnhHeroHost("SHGame.CoinStack.AnnouncePickup");
+	EnhHeroHost("SHGame.MoneyBag.AnnouncePickup");
+	EnhHeroHost("SHGame.MicePotionStrong.AnnouncePickup");
+	EnhHeroHost("SHGame.MicePotionWeak.AnnouncePickup");
+	EnhHeroHost("SHGame.PixiePotionStrong.AnnouncePickup");
+	EnhHeroHost("SHGame.PixiePotionWeak.AnnouncePickup");
+	EnhHeroHost("SHGame.StrengthPotion.AnnouncePickup");
+	EnhHeroHost("SHGame.CoinBonusGame.TimesUp.EndThisState");
+	EnhHeroHost("SHGame.SlotMachine.SlotMashineIdle.Timer");
+	EnhHeroHost("SHGame.ShrekPoster.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster2sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster3sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster4sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster5sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster6sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster7sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster8sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster9sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster10sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster11sh.AnnouncePickup");
+	EnhHeroHost("SHGame.ShrekPoster12sh.AnnouncePickup");
+}
+
+function bool HeroUsable(Pawn P)
+{
+	return P != None && !P.bDeleteMe && !P.bHidden && !P.IsInState('stateHeroDying') && float(P.GetPropertyText("Health")) > 0.0;
+}
+
+// ---- The opening of a level: each guest plays it in his own game, then joins ----
+// Owner's rule: the opening cutscene of a level runs on every player's machine as in the single-player game, and a guest joins the host only when his
+// is over. A level change of the host (the lobby's start, a level exit) sends each guest to the new level ALONE first (ClientIntroFirst): he loads it
+// as a single-player game with ?EnhIntroOnly=<host>, the stock opening plays exactly as it does for one player (its events, its moves, its camera),
+// he can skip it as in the stock game, and then he connects to the host with ?EnhIntroDone=<level>; his hero comes into the host's world where the
+// host's hero stands after the opening (IntroEnd), even if the host still watches his. A guest who comes into a level later plays its opening the
+// same way first. The cutscenes in the middle of a level are seen through the host's camera. ?EnhOff=introfirst: the guests follow the host directly.
+function ProcessServerTravel(string URL, bool bItems)
+{
+	local PlayerController P, LocalPlayer;
+	local bool bIntro;
+	local string M, Away;
+
+	// a guest alone in the opening: a level change of his own game (a cutscene-only level ends with one) means the opening is over: he joins the host
+	if (IntroOnlyHost != "")
+	{
+		JoinHostAfterIntro("the opening changes the level");
+		return;
+	}
+	M = UrlMap(URL);
+	bIntro = Level.NetMode == NM_ListenServer && !Off("introfirst") && HasOpening(M) && InStr(URL, "EnhLoad=") < 0 && InStr(URL, "EnhSkipIntro=1") < 0;
+	BaseMutator.ServerTraveling(URL, bItems);
+	Log("ProcessServerTravel: " $ URL $ " (guests play the opening first: " $ string(bIntro) $ ")");
+	foreach DynamicActors(Class'Engine.PlayerController', P)
+	{
+		if (NetConnection(P.Player) != None)
+		{
+			if (bIntro && EnhancedPlayerController(P) != None)
+			{
+				T("travel: " $ P.PlayerReplicationInfo.PlayerName $ " plays the opening of " $ M $ " by himself first");
+				EnhancedPlayerController(P).ClientIntroFirst(M);
+				if (Away != "")
+				{
+					Away = Away $ ".";
+				}
+				Away = Away $ Class'Enhanced.EnhancedText'.static.Encode(P.PlayerReplicationInfo.PlayerName);
+			}
+			else
+			{
+				P.ClientTravel(URL, TRAVEL_Relative, bItems);
+			}
+			continue;
+		}
+		LocalPlayer = P;
+		P.PreClientTravel();
+	}
+	if (Level.NetMode == NM_ListenServer && LocalPlayer != None)
+	{
+		Level.NextURL = Level.NextURL $ "?Team=" $ LocalPlayer.GetDefaultURL("Team") $ "?Name=" $ LocalPlayer.GetDefaultURL("Name") $ "?Class=" $ LocalPlayer.GetDefaultURL("Class") $ "?Character=" $ LocalPlayer.GetDefaultURL("Character");
+	}
+	// the new level waits for these guests once the host's opening is over (always named: an old URL's options are kept unless the new one names them)
+	if (Level.NetMode == NM_ListenServer)
+	{
+		Level.NextURL = Level.NextURL $ "?EnhAway=" $ Away;
+	}
+	if (Level.NetMode != NM_DedicatedServer && Level.NetMode != NM_ListenServer)
+	{
+		Level.NextSwitchCountdown = 0.0;
+	}
+}
+
+function bool WentForIntro(string Nick)
+{
+	local int i;
+
+	for (i = 0; i < AwayForIntro.Length; i++)
+	{
+		if (AwayForIntro[i] == Nick)
+		{
+			AwayForIntro.Remove(i, 1);
+			return true;
+		}
+	}
+	return false;
+}
+
+// ---- The host waits for the guests who still play the opening ----
+// Owner's rule: while a guest still plays a level's opening in his own game, the host whose opening is over waits for him: the world is paused (for
+// the guests already in it as well) and they read "wait for <name>: he is still watching the opening". The pause ends when every guest sent away
+// is back (Login with EnhIntroDone), or after four minutes without news (a guest whose game was closed meanwhile never comes back).
+// The names come with a level change (?EnhAway, hex-coded, dot-separated) or from PostLogin (a late guest sent to the opening).
+function ReadAway(string S)
+{
+	local int k;
+	local string N;
+
+	IntroWait.Length = 0;
+	while (S != "")
+	{
+		k = InStr(S, ".");
+		if (k < 0)
+		{
+			N = S;
+			S = "";
+		}
+		else
+		{
+			N = Left(S, k);
+			S = Mid(S, k + 1);
+		}
+		if (N != "")
+		{
+			IntroAway(Class'Enhanced.EnhancedText'.static.Decode(N));
+		}
+	}
+}
+
+function IntroAway(string Nick)
+{
+	local int i;
+
+	IntroWaitClock = 0.0;
+	for (i = 0; i < IntroWait.Length; i++)
+	{
+		if (IntroWait[i] == Nick)
+		{
+			return;
+		}
+	}
+	IntroWait[IntroWait.Length] = Nick;
+	T("intro wait: " $ Nick $ " plays the opening by himself, the world waits for him once the host's opening is over");
+}
+
+function IntroBack(string Nick)
+{
+	local int i;
+
+	if (IntroWait.Length == 0)
+	{
+		return;
+	}
+	for (i = 0; i < IntroWait.Length; i++)
+	{
+		if (IntroWait[i] == Nick)
+		{
+			IntroWait.Remove(i, 1);
+			T("intro wait: " $ Nick $ " is back, still waited for: " $ string(IntroWait.Length));
+			return;
+		}
+	}
+	// back under another name: one of the waited is back all the same
+	T("intro wait: " $ Nick $ " is back (not on the list, " $ IntroWait[0] $ " is taken off it)");
+	IntroWait.Remove(0, 1);
+}
+
+function string IntroWaitNames()
+{
+	local int i;
+	local string S;
+
+	for (i = 0; i < IntroWait.Length; i++)
+	{
+		if (i > 0)
+		{
+			S = S $ ", ";
+		}
+		S = S $ IntroWait[i];
+	}
+	return S;
+}
+
+// Every frame (EnhancedTicker, which ticks also while the world is paused).
+function IntroWaitTick(float DeltaTime)
+{
+	local PlayerController Host;
+	local Controller C;
+	local bool bWait;
+	local string S, E;
+
+	if (IntroWait.Length == 0 && !bIntroPaused)
+	{
+		return;
+	}
+	IntroWaitClock += DeltaTime;
+	if (Level.NetMode != NM_ListenServer || Off("introwait"))
+	{
+		IntroWait.Length = 0;
+	}
+	else if (IntroWait.Length > 0 && IntroWaitClock > 240.0)
+	{
+		T("intro wait: " $ IntroWaitNames() $ " did not come back in 240 s, the game goes on");
+		IntroWait.Length = 0;
+	}
+	Host = HostController();
+	bWait = IntroWait.Length > 0 && Host != None && Host.Pawn != None && Host.PlayerReplicationInfo != None && ActiveCut == None && !bRestarting && !IsMenuLevel() && !IsCutsceneLevel();
+	if (bWait && !bIntroPaused)
+	{
+		bIntroPaused = true;
+		IntroPausedAt = IntroWaitClock;
+		Level.Pauser = Host.PlayerReplicationInfo;
+		Level.PauseDelay = Level.TimeSeconds;   // paused at once; the stock big "paused" line is left out (the note says it)
+		T("intro wait: the host's opening is over, the world is paused for " $ IntroWaitNames());
+	}
+	else if (!bWait && bIntroPaused)
+	{
+		StopIntroWait();
+		return;
+	}
+	if (!bIntroPaused)
+	{
+		return;
+	}
+	if (IntroWait.Length == 1)
+	{
+		S = FillName(Localize("Lobby", "IntroWait1", "Enhanced"), IntroWaitNames());
+	}
+	else
+	{
+		S = FillName(Localize("Lobby", "IntroWaitN", "Enhanced"), IntroWaitNames());
+	}
+	if (S != IntroWaitNote)
+	{
+		IntroWaitNote = S;
+		E = Class'Enhanced.EnhancedText'.static.Encode(S);
+		for (C = Level.ControllerList; C != None; C = C.NextController)
+		{
+			if (EnhancedPlayerController(C) != None)
+			{
+				EnhancedPlayerController(C).WaitNote = E;
+			}
+		}
+	}
+	// tests: one picture of the waiting host, three seconds into the pause (the level's clock stands still, EnhShot's times do not come)
+	if (ShotTimes != "" && !bIntroShot && IntroWaitClock - IntroPausedAt > 3.0)
+	{
+		bIntroShot = true;
+		Host.ConsoleCommand("shot");
+		T("intro wait: shot taken during the pause");
+	}
+}
+
+function StopIntroWait()
+{
+	local Controller C;
+
+	T("intro wait: the pause ends after " $ string(int(IntroWaitClock - IntroPausedAt)) $ " s, still away: " $ string(IntroWait.Length));
+	bIntroPaused = false;
+	IntroWaitNote = "";
+	if (Level.Pauser != None)
+	{
+		Level.Pauser = None;
+	}
+	for (C = Level.ControllerList; C != None; C = C.NextController)
+	{
+		if (EnhancedPlayerController(C) != None)
+		{
+			EnhancedPlayerController(C).WaitNote = "";
+		}
+	}
+}
+
+function string UrlMap(string URL)
+{
+	local int P;
+
+	P = InStr(URL, "?");
+	if (P >= 0)
+	{
+		URL = Left(URL, P);
+	}
+	P = InStr(Caps(URL), ".UNR");
+	if (P >= 0)
+	{
+		URL = Left(URL, P);
+	}
+	return URL;
+}
+
+function bool HasOpening(string M)
+{
+	local int i;
+
+	for (i = 0; i < OpeningMaps.Length; i++)
+	{
+		if (OpeningMaps[i] ~= M)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// a guest alone in the level's opening: when it is over (no cutscene runs and his hero is his again) he joins the host; a level whose opening never
+// begins within eight seconds joins at once
+function IntroOnlyTick()
+{
+	local PlayerController PC;
+	local KWCutScene CS;
+	local bool bAny;
+
+	if (bIntroJoining)
+	{
+		return;
+	}
+	foreach DynamicActors(Class'KWGame.KWCutScene', CS)
+	{
+		if (CS.bInCutScene)
+		{
+			bAny = true;
+		}
+	}
+	if (bAny)
+	{
+		if (!bIntroSeen)
+		{
+			T("opening: begins on this machine, the host " $ IntroOnlyHost $ " is joined after it");
+		}
+		bIntroSeen = true;
+		IntroQuietSince = 0.0;
+		return;
+	}
+	if (!bIntroSeen && Level.TimeSeconds < 8.0)
+	{
+		return;
+	}
+	PC = HostController();
+	if (PC == None || PC.Pawn == None)
+	{
+		return;
+	}
+	if (IntroQuietSince == 0.0)
+	{
+		IntroQuietSince = Level.TimeSeconds;
+		return;
+	}
+	if (Level.TimeSeconds - IntroQuietSince > 0.5)
+	{
+		if (bIntroSeen)
+		{
+			JoinHostAfterIntro("the opening is over");
+		}
+		else
+		{
+			JoinHostAfterIntro("this level has no opening");
+		}
+	}
+}
+
+function JoinHostAfterIntro(string Why)
+{
+	local PlayerController PC;
+
+	if (bIntroJoining)
+	{
+		return;
+	}
+	bIntroJoining = true;
+	PC = HostController();
+	T("opening: " $ Why $ ", joining the host " $ IntroOnlyHost);
+	if (PC != None)
+	{
+		// the host plays this same level: through the menu book (a level loaded over another copy of itself crashed the engine, see Hop)
+		PC.ConsoleCommand("open " $ HopURL("join", MapName(), IntroOnlyHost));
+	}
+}
+
+// Loading a level over another copy of the same level (the host's swamp -> the guest's own swamp, and back) crashed the engine: it lets go of the old
+// level's loader first and then draws the loading screen with that old level (ATerrainInfo::UpdateVertices). The guest goes through the menu book,
+// a small level of its own, and from there to where he was going.
+static function string HopURL(string Mode, string Map, string Host)
+{
+	return "Book_FrontEnd.unr?Game=Enhanced.EnhancedGame?EnhIntroOnly=?EnhIntroDone=?EnhHop=" $ Mode $ "?EnhHopMap=" $ Map $ "?EnhHopHost=" $ Host;
+}
+
+function HopTick()
+{
+	local PlayerController PC;
+
+	if (bHopGone)
+	{
+		return;
+	}
+	PC = Level.GetLocalPlayerController();
+	if (PC == None)
+	{
+		return;
+	}
+	bHopGone = true;
+	if (HopMode ~= "intro")
+	{
+		T("hop: on to the opening of " $ HopMap $ " alone, then " $ HopHost);
+		PC.ConsoleCommand("open " $ HopMap $ "?Game=Enhanced.EnhancedGame?EnhHop=?EnhHopMap=?EnhHopHost=?EnhIntroDone=?EnhIntroOnly=" $ HopHost);
+	}
+	else
+	{
+		T("hop: on to the host " $ HopHost $ " after the opening of " $ HopMap);
+		PC.ConsoleCommand("open " $ HopHost $ "?EnhHop=?EnhHopMap=?EnhHopHost=?EnhIntroOnly=?EnhIntroDone=" $ HopMap);
+	}
+}
+
+// ---- Every player sees the cutscene in his own game ----
+// The stock cutscenes run where the game runs, on the host. When one starts there, every guest gets its script and its cast and plays it himself
+// (EnhancedPlayerController.StartLocalCut): his own camera, sound, subtitles and pace, skippable. His Shrek stays hidden until he says he is back
+// (ServerLocalCutDone); then it appears next to the host, in the host's world as it is by then. A guest who comes in while a cutscene plays gets it too,
+// from its start. ?EnhOff=localcut: the old way (the guests watch the host's camera).
+function WatchCutscenes()
+{
+	local KWCutScene CS;
+	local int i;
+	local EnhancedPlayerController PC;
+
+	if (Off("localcut") || Level.NetMode != NM_ListenServer || IsMenuLevel())
+	{
+		return;
+	}
+	if (CutList.Length == 0 || Level.TimeSeconds - CutListAt > 10.0)
+	{
+		CutListAt = Level.TimeSeconds;
+		CutList.Length = 0;
+		foreach DynamicActors(Class'KWGame.KWCutScene', CS)
+		{
+			if (EnhancedLocalCut(CS) == None)
+			{
+				CutList[CutList.Length] = CS;
+			}
+		}
+	}
+	if (ActiveCut != None && (ActiveCut.bDeleteMe || !ActiveCut.bInCutScene))
+	{
+		T("cutscene " $ ActiveCut.ScriptFileName $ " is over on the host after " $ string(int(Level.TimeSeconds - ActiveCutStart)) $ " s");
+		for (i = 0; i < GPC.Length; i++)
+		{
+			PC = EnhancedPlayerController(GPC[i]);
+			if (PC != None && PC.LocalCutSent == CutSerial)
+			{
+				PC.ClientCutHostEnded(CutSerial, Level.TimeSeconds - ActiveCutStart);
+			}
+		}
+		ActiveCut = None;
+		bPullAfterCut = true;
+	}
+	if (bPullAfterCut && HostController() != None && HostController().Pawn != None)
+	{
+		bPullAfterCut = false;
+		PullGuestsToHost(HostController());
+	}
+	if (ActiveCut == None)
+	{
+		for (i = 0; i < CutList.Length; i++)
+		{
+			if (CutList[i] != None && CutList[i].bInCutScene)
+			{
+				ActiveCut = CutList[i];
+				ActiveCutStart = Level.TimeSeconds;
+				CutSerial++;
+				NoteCutStartPlace();
+				T("cutscene " $ ActiveCut.ScriptFileName $ " starts on the host (number " $ string(CutSerial) $ ")");
+				break;
+			}
+		}
+	}
+	for (i = 0; i < GPC.Length; i++)
+	{
+		PC = EnhancedPlayerController(GPC[i]);
+		if (PC == None)
+		{
+			continue;
+		}
+		if (bLocalCutOpt && ActiveCut != None && PC.LocalCutSent != CutSerial && PC.Player != None && PC.PlayerReplicationInfo != None)
+		{
+			SendLocalCut(PC);
+		}
+		// a guest who never answers (his game is stuck, or he has an old build) is not waited for longer than ten minutes
+		if (PC.bLocalCutBusy && Level.TimeSeconds - PC.LocalCutBusySince > 600.0)
+		{
+			T("cutscene: " $ PC.PlayerReplicationInfo.PlayerName $ " did not come back from his cutscene, his Shrek is shown anyway");
+			PC.bLocalCutBusy = false;
+			EnhDeaf(PC, 0);
+			SendHostSong(PC);
+		}
+	}
+}
+
+// where the host's hero stands as the host's cutscene begins (see HostPlace): the level's start for an opening, else his place
+function bool IntroEndFor(out Vector V)
+{
+	local int i, P;
+	local string S, M;
+
+	M = MapName();
+	for (i = 0; i < IntroEnd.Length; i++)
+	{
+		P = InStr(IntroEnd[i], "=");
+		if (P > 0 && Left(IntroEnd[i], P) ~= M)
+		{
+			S = Mid(IntroEnd[i], P + 1);
+			V.X = float(NextComma(S));
+			V.Y = float(NextComma(S));
+			V.Z = float(S);
+			return true;
+		}
+	}
+	return false;
+}
+
+function string NextComma(out string S)
+{
+	local int P;
+	local string R;
+
+	P = InStr(S, ",");
+	if (P < 0)
+	{
+		R = S;
+		S = "";
+		return R;
+	}
+	R = Left(S, P);
+	S = Mid(S, P + 1);
+	return R;
+}
+
+function NoteCutStartPlace()
+{
+	local Vector Spot;
+	local Rotator R;
+	local Pawn H;
+
+	bCutStartLoc = false;
+	// the opening of a level: where the host will stand after it (the swamp's opening is played at the house, then the level throws the hero to the
+	// obstacle course with an event of its own: the level's start spot is the house); a level not in the table: its start spot
+	if (Level.TimeSeconds < 8.0 && IntroEndFor(Spot))
+	{
+		CutStartHeroLoc = Spot;
+		bCutStartLoc = true;
+	}
+	else if (Level.TimeSeconds < 8.0 && FindStartSpot(Spot, R))
+	{
+		CutStartHeroLoc = Spot;
+		bCutStartLoc = true;
+	}
+	else
+	{
+		H = HostHero(HostController());
+		if (H != None)
+		{
+			CutStartHeroLoc = H.Location;
+			bCutStartLoc = true;
+		}
+	}
+	if (Level.TimeSeconds < 8.0)
+	{
+		bLevelHadOpening = true;
+		OpeningSerial = CutSerial;
+	}
+	if (bCutStartLoc)
+	{
+		T("cutscene: the host's hero stands at " $ string(CutStartHeroLoc) $ " as it begins (a guest through his own one early comes in there)");
+	}
+}
+
+// The host's cutscene is over and the host is in the world again: a guest who came in earlier (through his own cutscene first) and stands far from
+// him is put next to him at once (the host's world is the one the guests take; the leash would bring him only after its countdown).
+function PullGuestsToHost(PlayerController Host)
+{
+	local int i, k;
+	local Vector Loc;
+	local bool bPlaced;
+	local float D;
+
+	for (i = 0; i < GPC.Length; i++)
+	{
+		SelectGuest(i);
+		if (P2Pawn != None && !bP2Hidden && VSize(P2Pawn.Location - Host.Pawn.Location) > 3000.0)
+		{
+			D = VSize(P2Pawn.Location - Host.Pawn.Location);
+			ChooseJoinCenter(Host);
+			bPlaced = false;
+			for (k = 0; k < 40 && !bPlaced; k++)
+			{
+				if (GuestSpot(Host, k, Loc))
+				{
+					bPlaced = P2Pawn.SetLocation(Loc);
+				}
+			}
+			if (bPlaced)
+			{
+				P2Pawn.Velocity = vect(0.0, 0.0, 0.0);
+				P2Pawn.SetPhysics(PHYS_Falling);
+				PendingPC.ClientSetLocation(P2Pawn.Location, PendingPC.Rotation);
+				ChaseRotation(Host);
+			}
+			T("cutscene over: " $ PendingPC.PlayerReplicationInfo.PlayerName $ " stood " $ string(int(D)) $ " units away, put next to the host: " $ string(bPlaced));
+		}
+		StoreGuest(i);
+	}
+}
+
+function SendLocalCut(EnhancedPlayerController PC)
+{
+	local int j, N;
+	local KWCutController CC;
+	local Pawn P;
+
+	N = 0;
+	for (j = 0; j < ActiveCut.CutControllers.Length; j++)
+	{
+		CC = ActiveCut.CutControllers[j];
+		if (CC == None || CC.Pawn == None)
+		{
+			continue;
+		}
+		P = CC.Pawn;
+		PC.ClientCutCast(N, CC.pawntag, P.GetPropertyText("Label"), P, string(P.Class), P.Location, P.Rotation);
+		N++;
+	}
+	PC.ClientLocalCut(ActiveCut.ScriptFileName, string(ActiveCut.Tag), N, CutSerial, ActiveCut.bNoBypass);
+	PC.LocalCutSent = CutSerial;
+	PC.bLocalCutBusy = true;
+	EnhDeaf(PC, 1);
+	PC.LocalCutBusySince = Level.TimeSeconds;
+	T("cutscene " $ ActiveCut.ScriptFileName $ " sent to " $ PC.PlayerReplicationInfo.PlayerName $ " with " $ string(N) $ " actors");
 }
 
 function IdleWatch()
@@ -653,6 +1748,13 @@ event PlayerController Login(string Portal, string Options, out string Error)
 	if (ParseOption(Options, "Name") != "")
 	{
 		ChangeName(NewPlayer, ParseOption(Options, "Name"), false);
+	}
+	// he has played this level's opening on his own machine (see ClientIntroFirst) and joined after it
+	if (EnhancedPlayerController(NewPlayer) != None && ParseOption(Options, "EnhIntroDone") ~= MapName())
+	{
+		EnhancedPlayerController(NewPlayer).bIntroDone = true;
+		T("step 9b: he has played the opening of " $ MapName() $ " by himself");
+		IntroBack(NewPlayer.PlayerReplicationInfo.PlayerName);
 	}
 	AddGuest(NewPlayer);
 	T("step 10: login done, the pawn of player two is made after the cutscenes");
@@ -1123,6 +2225,11 @@ event Logout(Controller Exiting)
 	local bool bGuest;
 
 	bGuest = IsGuestPC(Exiting);
+	if (PlayerController(Exiting) != None)
+	{
+		EnhDeaf(PlayerController(Exiting), 0);
+		EnhHeroClear();     // his hero goes: the engine layer must not keep it until the next Poll
+	}
 	if (bGuest)
 	{
 		Nick = Exiting.PlayerReplicationInfo.PlayerName;
@@ -1130,7 +2237,13 @@ event Logout(Controller Exiting)
 		RemoveGuest(GuestIndex(Exiting));
 	}
 	Super.Logout(Exiting);
-	// his Shrek falls (the stock controller takes the pawn down with it) and stays on the ground; the host decides about the session
+	// his Shrek falls (the stock controller takes the pawn down with it) and stays on the ground; the host decides about the session. A guest who left to
+	// play the opening by himself comes back: no question then.
+	if (bGuest && WentForIntro(Nick))
+	{
+		T("a guest left to play the opening by himself: " $ Nick);
+		return;
+	}
 	if (bGuest && GPC.Length == 0 && !bRestarting && !bLaunching && !IsMenuLevel() && Level.NextURL == "")
 	{
 		AskCloseSession(Nick);
@@ -1466,6 +2579,11 @@ function SyncGuestHud()
 	{
 		Potions = InvOf(Host.Pawn).GetInventoryCount(PotionName(N));
 	}
+	if (Level.TimeSeconds - HudExtraAt > 0.2)
+	{
+		HudExtraAt = Level.TimeSeconds;
+		HudExtraNow = HostHudExtra(Host);
+	}
 	for (C = Level.ControllerList; C != None; C = C.NextController)
 	{
 		G = EnhancedPlayerController(C);
@@ -1475,8 +2593,76 @@ function SyncGuestHud()
 			G.HudPotions = Potions;
 			G.HudPotionSel = Sel;
 			G.HudIcons = Icons;
+			if (G.HudExtra != HudExtraNow)
+			{
+				G.HudExtra = HudExtraNow;
+			}
 		}
 	}
+}
+
+// What the host's own HUD shows besides health, coins and potions, for the guests' HUDs (the stock HUD items draw only on the host's screen): the boss's
+// health bar ("B:<fraction>:<boss>"), the game timer ("T:<fraction>") and the potion timer ("P:<fraction>"), each while the host's item is showing.
+function string HostHudExtra(PlayerController Host)
+{
+	local KWHud H;
+	local int i;
+	local string S, Boss;
+	local KWHudItem It;
+	local Actor B;
+	local float Cur, Len;
+
+	H = KWHud(Host.myHUD);
+	if (H == None)
+	{
+		return "";
+	}
+	for (i = 0; i < H.HudItems.Length; i++)
+	{
+		It = H.HudItems[i];
+		if (It == None || It.IsInState('Idle'))
+		{
+			continue;
+		}
+		if (It.IsA('HudItemHealthBoss') && KWPawn(Host.Pawn) != None)
+		{
+			B = KWPawn(Host.Pawn).aBoss;
+			if (B != None)
+			{
+				Boss = "pib";
+				if (B.IsA('BossFGM'))
+				{
+					Boss = "fgm";
+				}
+				else if (B.IsA('FatKnight'))
+				{
+					Boss = "fat";
+				}
+				else if (B.IsA('BanditBoss'))
+				{
+					Boss = "bandit";
+				}
+				S = S $ "B:" $ string(FClamp(float(It.GetPropertyText("Damage")), 0.0, 1.0)) $ ":" $ Boss $ ";";
+			}
+		}
+		else if (It.IsA('SHHudGameTimer') || It.IsA('SHHudPotionTimer'))
+		{
+			Cur = float(It.GetPropertyText("Current"));
+			Len = float(It.GetPropertyText("Length"));
+			if (Len > 0.0)
+			{
+				if (It.IsA('SHHudGameTimer'))
+				{
+					S = S $ "T:" $ string(FClamp(Cur / Len, 0.0, 1.0)) $ ";";
+				}
+				else
+				{
+					S = S $ "P:" $ string(FClamp(Cur / Len, 0.0, 1.0)) $ ";";
+				}
+			}
+		}
+	}
+	return S;
 }
 
 // ---- Enemy scaling ----
@@ -2860,6 +4046,10 @@ function ShowHostNote()
 	{
 		S = DownNoteHost;
 	}
+	else if (LeashNoteHost != "")
+	{
+		S = LeashNoteHost;
+	}
 	if (S == "" || Level.TimeSeconds - NoteTime < 2.0)
 	{
 		return;
@@ -3025,18 +4215,23 @@ function UpdateExits()
 // Two players may not drift apart for good: when they are farther apart than LeashDistance for longer than
 // LeashGrace, the one who ran ahead (farther from the last checkpoint, or from the level start) is brought
 // back, to the last checkpoint if his partner is within reach of it, otherwise to his partner.
+// He sees the seconds left on his screen first (the old warning was a client message, which a guest's controller swallows: guests were moved
+// without a word). Nobody is moved during a cutscene (the cutscene hides and places the heroes itself), while somebody is down, or while the
+// one ahead waits at a cutscene gate (the gate holds him there on purpose; moving him away broke the wait).
 function CheckLeash()
 {
 	local Controller C;
 	local PlayerController PC, Runaway, Other;
 	local array<PlayerController> L;
-	local Vector Ref, Target;
+	local Vector Ref, Target, Center;
 	local Rotator SpotRot;
 	local float d, dd;
 	local int i;
+	local bool bPlaced;
 
-	if (Off("leash"))
+	if (Off("leash") || IsMenuLevel() || IsCutsceneLevel() || bHold || bRestarting)
 	{
+		StopLeash();
 		return;
 	}
 	for (C = Level.ControllerList; C != None; C = C.NextController)
@@ -3044,21 +4239,42 @@ function CheckLeash()
 		PC = PlayerController(C);
 		if (PC != None && PC.Pawn != None)
 		{
+			if (PC.Pawn.bHidden || PC.Pawn.IsInState('stateHeroDying'))
+			{
+				StopLeash();
+				return;
+			}
 			L[L.Length] = PC;
 		}
 	}
 	if (L.Length < 2)
 	{
-		LeashSince = 0.0;
+		StopLeash();
 		return;
 	}
 	if (bHaveCheckpointLoc)
 	{
 		Ref = LastCheckpointLoc;
 	}
-	else if (!FindStartSpot(Ref, SpotRot))
+	else
 	{
-		Ref = L[0].Pawn.Location;
+		// the start of the level is looked up once (it was looked up, and written to the log, on every frame)
+		if (LeashStartState == 0)
+		{
+			LeashStartState = 2;
+			if (FindStartSpot(LeashStart, SpotRot))
+			{
+				LeashStartState = 1;
+			}
+		}
+		if (LeashStartState == 1)
+		{
+			Ref = LeashStart;
+		}
+		else
+		{
+			Ref = L[0].Pawn.Location;
+		}
 	}
 	// the anchor is the player nearest to the checkpoint (or the start); the runaway is whoever is farthest from the anchor
 	Other = L[0];
@@ -3080,39 +4296,102 @@ function CheckLeash()
 			Runaway = L[i];
 		}
 	}
-	if (Runaway == None || d <= LeashDistance)
+	if (Runaway == None || d <= LeashDistance || AtGate(Runaway))
 	{
-		LeashSince = 0.0;
+		StopLeash();
 		return;
 	}
-	if (LeashSince == 0.0)
+	if (LeashSince == 0.0 || LeashWarned != Runaway)
 	{
+		StopLeash();
 		LeashSince = Level.TimeSeconds;
+		LeashWarned = Runaway;
 		T("leash: " $ string(int(d)) $ " units apart, " $ string(Runaway) $ " is ahead, back in " $ string(int(LeashGrace)) $ " s");
-		Runaway.ClientMessage("Wait for your partner: you will be brought back in " $ string(int(LeashGrace)) $ " seconds.");
-		return;
 	}
 	if (Level.TimeSeconds - LeashSince < LeashGrace)
 	{
+		SetLeashNote(Runaway, FillName(Localize("Lobby", "LeashWarn", "Enhanced"), string(int(LeashGrace - (Level.TimeSeconds - LeashSince)) + 1)));
 		return;
 	}
-	LeashSince = 0.0;
+	StopLeash();
+	// a free place on the ground around the checkpoint or the partner (the old way put him right on top of his partner, where the move could fail)
+	SetupSpawnScale(Runaway.Pawn);
 	if (bHaveCheckpointLoc && VSize(Other.Pawn.Location - LastCheckpointLoc) <= LeashDistance)
 	{
-		Target = LastCheckpointLoc;
-		T("leash: " $ string(Runaway) $ " is returned to the last checkpoint at " $ string(Target));
+		Center = BodyAt(LastCheckpointLoc);
+		T("leash: " $ string(Runaway) $ " is returned to the last checkpoint at " $ string(Center));
 	}
 	else
 	{
-		Target = Other.Pawn.Location;
-		T("leash: " $ string(Runaway) $ " is brought to his partner at " $ string(Target));
+		Center = Other.Pawn.Location;
+		T("leash: " $ string(Runaway) $ " is brought to his partner at " $ string(Center));
 	}
-	Target.Z += 60.0;
-	Runaway.Pawn.SetLocation(Target);
+	bPlaced = PlaceNear(Runaway.Pawn, Center, Other.Pawn.Rotation);
+	if (!bPlaced)
+	{
+		Target = Center;
+		Target.Z += 60.0;
+		bPlaced = Runaway.Pawn.SetLocation(Target);
+	}
+	T("leash: placed=" $ string(bPlaced) $ " at " $ string(Runaway.Pawn.Location));
 	Runaway.Pawn.Velocity = vect(0.0, 0.0, 0.0);
 	Runaway.Pawn.SetPhysics(PHYS_Falling);
 	Runaway.ClientSetLocation(Runaway.Pawn.Location, Runaway.Pawn.Rotation);
-	Runaway.ClientMessage("You were brought back to your partner.");
+}
+
+// the leash is not counting: its note goes away
+function StopLeash()
+{
+	LeashSince = 0.0;
+	if (LeashWarned != None)
+	{
+		SetLeashNote(LeashWarned, "");
+		LeashWarned = None;
+	}
+}
+
+function SetLeashNote(PlayerController PC, string S)
+{
+	if (EnhancedPlayerController(PC) != None)
+	{
+		EnhancedPlayerController(PC).LeashNote = Class'Enhanced.EnhancedText'.static.Encode(S);
+	}
+	else
+	{
+		LeashNoteHost = S;
+	}
+}
+
+// the player waits at a cutscene gate he reached first
+function bool AtGate(Controller C)
+{
+	local int i;
+
+	for (i = 0; i < PassCtl.Length; i++)
+	{
+		if (PassCtl[i] == C)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// where the centre of a hero's body is when he stands on the floor under V (a checkpoint place is kept on the floor, a level start at the body)
+function Vector BodyAt(Vector V)
+{
+	local Vector HitLoc, HitNorm, From, To;
+
+	From = V;
+	From.Z += 80.0;
+	To = V;
+	To.Z -= 600.0;
+	if (Trace(HitLoc, HitNorm, To, From, false) != None)
+	{
+		HitLoc.Z += HostH;
+		return HitLoc;
+	}
+	return V;
 }
 
 // Entry point for every save request of the game (see EnhancedHeroController). One request can arrive
@@ -3249,6 +4528,12 @@ function OnCheckpointRequest(Controller Who, string Why)
 	local Vector Origin;
 	local bool bAnchor;
 
+	// a guest who plays the opening by himself before he joins saves nothing (the opening ends with "SaveGame 1": it would write his own saves)
+	if (IntroOnlyHost != "")
+	{
+		return;
+	}
+
 	if (InStr(Caps(MapName()), "BEANSTALK") >= 0)
 	{
 		T("checkpoint request in the bonus level ignored (" $ Why $ ")");
@@ -3344,6 +4629,15 @@ function int SaveCell()
 // Twice a second (from EnhancedTicker): a waiting checkpoint is completed as soon as the last player has passed it.
 function Poll()
 {
+	if (HopMode != "")
+	{
+		HopTick();
+		return;
+	}
+	if (bIntroPaused)
+	{
+		return;
+	}
 	// The players were gathered in the menu's room; after the level change they come back one by one. The opening cutscene starts 3 s after the last of
 	// them is back, and without waiting for ever for one who did not come (a minute and a half after the level began).
 	if (bHold)
@@ -3384,10 +4678,19 @@ function Poll()
 	{
 		PatchResolutionList();
 	}
+	if (IntroOnlyHost != "")
+	{
+		IntroOnlyTick();
+	}
 	TakeShots();
+	HeroTweaks();
+	SaveTestTick();
 	SyncGuestHud();
 	EnsureAnimSync();
 	IdleWatch();
+	WatchCutscenes();
+	HeroTick();
+	MusicTick();
 	DeathWatch();
 	ManageSecond();
 	SyncFriendlyFire();
@@ -3626,6 +4929,36 @@ function bool FormationSpot(Vector Center, Rotator Rot, int k, out Vector Spot)
 // made of the ring around him in a fixed order that looks intended: guest 1 on his right, guest 2 on his left, guest 3 behind him (the ring places
 // are 45 degrees apart, place 0 is on the right, 2 ahead, 4 on the left, 6 behind). If a place is not walkable the nearest one of the same ring is taken,
 // then the same places on the wider ring.
+// The host's hero, also while a cutscene drives him (the host's controller has no pawn then: the cutscene's controller has it, with the host's
+// controller as its PendingController).
+function Pawn HostHero(PlayerController Host)
+{
+	local KWPawn P;
+
+	if (Host == None)
+	{
+		return None;
+	}
+	if (Host.Pawn != None)
+	{
+		LastHostHero = Host.Pawn;
+		return Host.Pawn;
+	}
+	if (LastHostHero != None && !LastHostHero.bDeleteMe)
+	{
+		return LastHostHero;
+	}
+	foreach DynamicActors(Class'KWGame.KWPawn', P)
+	{
+		if (KWCutController(P.Controller) != None && KWCutController(P.Controller).PendingController == Host)
+		{
+			LastHostHero = P;
+			return P;
+		}
+	}
+	return None;
+}
+
 function bool GuestSpot(PlayerController Host, int i, out Vector Spot)
 {
 	local int Pref, Step, Ring, Block, Off;
@@ -3676,7 +5009,7 @@ function bool GuestSpot(PlayerController Host, int i, out Vector Spot)
 	{
 		return false;
 	}
-	return GroundSpot(JoinCenter, Host.Pawn.Rotation, Ring, Spot);
+	return GroundSpot(JoinCenter, HostHero(Host).Rotation, Ring, Spot);
 }
 
 // Puts a pawn on the first free ring place around a center (SetLocation fails where there is no room, so
@@ -3702,21 +5035,37 @@ function bool PlaceNear(Pawn P, Vector Center, Rotator Rot)
 // Where a guest who comes in is put: next to the host, unless the host is in a fight (a living enemy within 1800 units) and a checkpoint has been passed:
 // then at that checkpoint, a quiet place the level itself offers (the guest walks to the host from there; the leash brings him if he is far). Before any
 // checkpoint, and in a level without enemies, next to the host.
+// Where the host's hero is in the world. While a cutscene drives him he may stand on its stage (the swamp's opening plays at the house, and the host
+// starts at the obstacle course after it): a guest who is through his own cutscene earlier is put where the host's hero stood when it began, and for
+// the opening of a level at the level's start.
+function Vector HostPlace(PlayerController Host)
+{
+	if (Host != None && Host.Pawn != None)
+	{
+		return Host.Pawn.Location;
+	}
+	if (bCutStartLoc)
+	{
+		return CutStartHeroLoc;
+	}
+	return HostHero(Host).Location;
+}
+
 function bool ChooseJoinCenter(PlayerController Host)
 {
 	local Pawn A;
 	local Vector HitLoc, HitNorm, From, To, V;
 	local int Foes, i, Passed, Saved;
 
-	SetupSpawnScale(Host.Pawn);
-	JoinCenter = Host.Pawn.Location;
+	SetupSpawnScale(HostHero(Host));
+	JoinCenter = HostPlace(Host);
 	if (!bHaveCheckpointLoc)
 	{
 		return false;
 	}
 	foreach DynamicActors(Class'Engine.Pawn', A)
 	{
-		if (A.IsA('ShEnemy') && float(A.GetPropertyText("Health")) > 0.0 && VSize(A.Location - Host.Pawn.Location) < 1800.0)
+		if (A.IsA('ShEnemy') && float(A.GetPropertyText("Health")) > 0.0 && VSize(A.Location - HostPlace(Host)) < 1800.0)
 		{
 			Foes++;
 		}
@@ -3741,7 +5090,7 @@ function bool ChooseJoinCenter(PlayerController Host)
 	SpawnFails = 41;
 	for (i = 0; i < 40; i++)
 	{
-		if (GroundSpot(JoinCenter, Host.Pawn.Rotation, i, V))
+		if (GroundSpot(JoinCenter, HostHero(Host).Rotation, i, V))
 		{
 			Passed++;
 		}
@@ -3750,7 +5099,7 @@ function bool ChooseJoinCenter(PlayerController Host)
 	if (Passed < 4)
 	{
 		T("join: only " $ string(Passed) $ " free places around the checkpoint " $ string(JoinCenter) $ ", the guest is put next to the host");
-		JoinCenter = Host.Pawn.Location;
+		JoinCenter = HostPlace(Host);
 		return false;
 	}
 	T("join: " $ string(Foes) $ " enemies near the host, the guest is put at the last checkpoint " $ string(JoinCenter));
@@ -3816,21 +5165,271 @@ function bool ForcedSpot(Vector Center, Rotator Rot, int k, out Vector Spot)
 
 function Pawn SpawnGuestPawn(PlayerController Host, Vector Loc)
 {
+	local Pawn P;
+
 	// the guest is the same hero as the host's (the Donkey in the Hunt and the Donkey levels, Puss in Boots in his levels)
-	if (Host.Pawn.IsA('Donkey'))
+	if (HostHero(Host).IsA('Donkey'))
 	{
-		return Spawn(Class'Enhanced.EnhancedDonkey', , 'SecondShrek', Loc, Host.Pawn.Rotation);
+		P = Spawn(Class'Enhanced.EnhancedDonkey', , 'SecondShrek', Loc, HostHero(Host).Rotation);
 	}
-	if (Host.Pawn.IsA('PIB'))
+	else if (HostHero(Host).IsA('PIB'))
 	{
-		return Spawn(Class'Enhanced.EnhancedPib', , 'SecondShrek', Loc, Host.Pawn.Rotation);
+		P = Spawn(Class'Enhanced.EnhancedPib', , 'SecondShrek', Loc, HostHero(Host).Rotation);
 	}
-	if (string(Host.Pawn.Class) ~= "ShGame.Shrek")
+	else if (string(HostHero(Host).Class) ~= "ShGame.Shrek")
 	{
-		return Spawn(Class'Enhanced.EnhancedShrek', , 'SecondShrek', Loc, Host.Pawn.Rotation);
+		P = Spawn(Class'Enhanced.EnhancedShrek', , 'SecondShrek', Loc, HostHero(Host).Rotation);
 	}
-	// any other hero (Mongo, the human Shrek): the same class as the host's
-	return Spawn(Host.Pawn.Class, , 'SecondShrek', Loc, Host.Pawn.Rotation);
+	else
+	{
+		// any other hero (Mongo, the human Shrek, the Steed): the same class as the host's
+		P = Spawn(HostHero(Host).Class, , 'SecondShrek', Loc, HostHero(Host).Rotation);
+	}
+	if (P != None)
+	{
+		CopyHeroValues(HostHero(Host), P);
+	}
+	return P;
+}
+
+// A level sets its own values on the hero it places (the map's actor), a spawned guest had the class defaults: the Steed of 7_Prison_Donkey double
+// jumps 128 (96 for a guest), Puss in the factory 4_FGM_PIB dies from falls over 1000 (768), Castle Siege and Hamlet set other run and walk speeds,
+// the swamp takes the jump attack away. The guest is the same class as the host's hero: he gets the host's values.
+function CopyHeroValues(Pawn From, Pawn To)
+{
+	local string Names, N, V, Log1;
+	local int k;
+	local KWPawn KP;
+
+	if (From == None || To == None || Off("herovalues"))
+	{
+		return;
+	}
+	Names = "fJumpHeight,fDoubleJumpHeight,DeathIfFallDistance,GroundRunSpeed,GroundWalkSpeed,bCanUseJumpAttack,JumpAttackMoveAhead,";
+	while (Names != "")
+	{
+		k = InStr(Names, ",");
+		N = Left(Names, k);
+		Names = Mid(Names, k + 1);
+		V = From.GetPropertyText(N);
+		if (V != "" && To.GetPropertyText(N) != V)
+		{
+			To.SetPropertyText(N, V);
+			Log1 = Log1 $ " " $ N $ "=" $ V;
+		}
+	}
+	KP = KWPawn(To);
+	if (KP != None)
+	{
+		KP.SetJumpVars();
+		KP.GroundSpeed = KP.GroundRunSpeed;
+		if (KP.GroundRunSpeed > 0.0)
+		{
+			KP.WalkingPct = KP.GroundWalkSpeed / KP.GroundRunSpeed;
+		}
+	}
+	if (Log1 != "")
+	{
+		T("spawn: the level's values of the host's hero for " $ string(To) $ ":" $ Log1);
+	}
+}
+
+// ---- The host's camera stays on his hero ----
+// Every frame (EnhancedTicker). Moving a guest's pawn with the stock KWPawn.MovePawn (a telepit, a level's move command) turns the camera of "the
+// player" to that pawn: KWGetCamera() is always the host's camera. Outside the host's cutscenes his camera goes back to his own hero at once.
+// (The review's telepit fade for a guest is not needed: no retail map places a TelePit, checked with UELib on all 20 maps.)
+function HostCameraWatch()
+{
+	local PlayerController Host;
+	local KWHeroController KH;
+	local Actor Tgt;
+
+	if (GPC.Length == 0 || Off("camwatch"))
+	{
+		return;
+	}
+	Host = HostController();
+	KH = KWHeroController(Host);
+	if (KH != None && KH.Camera != None && Host.Pawn != None && ActiveCut == None)
+	{
+		Tgt = KH.Camera.GetCurrentTargetActor();
+		if (Pawn(Tgt) != None && Tgt != Host.Pawn && EnhancedPlayerController(Pawn(Tgt).Controller) != None)
+		{
+			KH.Camera.InitTarget(Host.Pawn, 0.0, false, true);
+			T("camera: the host's camera was turned to the guest's " $ string(Tgt) $ ", back on the host's hero");
+		}
+	}
+}
+
+// ---- Fixes taken from MPatcher (Master_64's MPak, Shrek 2.2), the owner's choice of 2026-11-20; ?EnhOff=mpatcher turns them off ----
+// Every two seconds (Poll): the Steed double jumps 128 everywhere (the stock has it only in his own level 7_Prison_Donkey, 96 where the others can
+// switch to him); Puss in Boots dies from a fall over 1000 everywhere (his factory level's value; 768 elsewhere); the swinging stones and spiked balls
+// hit with a cylinder of 100 x 100 instead of a box of 150 x 200 (they hit a hero they visibly missed). The guests' controllers get their hero's jump
+// heights: a guest's machine predicts his jumps with them.
+function HeroTweaks()
+{
+	local KWPawn P;
+	local Controller C;
+	local EnhancedPlayerController G;
+
+	if (Level.TimeSeconds < TweakAt)
+	{
+		return;
+	}
+	TweakAt = Level.TimeSeconds + 2.0;
+	if (!Off("mpatcher"))
+	{
+		foreach DynamicActors(Class'KWGame.KWPawn', P)
+		{
+			if (P.IsA('Steed') && P.fDoubleJumpHeight < 128.0)
+			{
+				P.fDoubleJumpHeight = 128.0;
+				P.SetJumpVars();
+				T("mpatcher: " $ string(P) $ " double jumps 128");
+			}
+			else if (P.IsA('PIB') && int(P.GetPropertyText("DeathIfFallDistance")) < 1000)
+			{
+				P.SetPropertyText("DeathIfFallDistance", "1000");
+				T("mpatcher: " $ string(P) $ " dies from falls over 1000");
+			}
+		}
+		FixSwings(self);
+	}
+	for (C = Level.ControllerList; C != None; C = C.NextController)
+	{
+		G = EnhancedPlayerController(C);
+		if (G != None && KWPawn(G.Pawn) != None)
+		{
+			G.HeroJump = KWPawn(G.Pawn).fJumpHeight;
+			G.HeroDoubleJump = KWPawn(G.Pawn).fDoubleJumpHeight;
+		}
+	}
+}
+
+// the server's swinging attachments and a guest's copies of them (his movement is predicted against them)
+static function FixSwings(Actor Ctx)
+{
+	local Pawn A;
+
+	foreach Ctx.DynamicActors(Class'Engine.Pawn', A)
+	{
+		if ((A.IsA('SwingStoneAttachment') || A.IsA('BallSpikedAttachment')) && (A.CollisionRadius != 100.0 || A.CollisionHeight != 100.0))
+		{
+			A.SetCollisionSize(100.0, 100.0);
+			A.SetPropertyText("CollideType", "CT_Cylinder");
+			Log("[SDBG] mpatcher: " $ string(A) $ " hits with a cylinder of 100 x 100");
+		}
+	}
+}
+
+// Tests: a stock save (slot 9 of the test profile) with the hero's health at 37 and a picture, three seconds later the load of it; after the load
+// PostLoadGame logs the health and the projectors, and one more picture is taken.
+function SaveTestTick()
+{
+	local PlayerController Host;
+	local Projector Pj;
+
+	Host = HostController();
+	if (Host == None || Host.Pawn == None)
+	{
+		return;
+	}
+	if (SaveTestAt > 0.0 && !bSaveTestDone && Level.TimeSeconds >= SaveTestAt)
+	{
+		bSaveTestDone = true;
+		Host.Pawn.SetPropertyText("Health", "37");
+		foreach AllActors(Class'Engine.Projector', Pj)
+		{
+			if (!Pj.IsA('ShadowProjector'))
+			{
+				Log("[SDBG] save test: projector " $ string(Pj) $ " render info before the save '" $ Pj.GetPropertyText("RenderInfo") $ "'");
+			}
+		}
+		Log("[SDBG] save test: health of " $ string(Host.Pawn) $ " set to " $ Host.Pawn.GetPropertyText("Health") $ ", saving to slot 9");
+		Host.ConsoleCommand("shot");
+		Host.ConsoleCommand("SaveGame 9");
+		SaveTestLoadAt = Level.TimeSeconds + 3.0;
+		return;
+	}
+	if (SaveTestLoadAt > 0.0 && Level.TimeSeconds >= SaveTestLoadAt)
+	{
+		SaveTestLoadAt = 0.0;
+		Log("[SDBG] save test: loading slot 9");
+		Host.ConsoleCommand("open ?load=9");
+		return;
+	}
+	if (SaveTestShotAt > 0.0 && Level.TimeSeconds >= SaveTestShotAt)
+	{
+		SaveTestShotAt = 0.0;
+		Log("[SDBG] save test: after the load, health of " $ string(Host.Pawn) $ " " $ Host.Pawn.GetPropertyText("Health"));
+		Host.ConsoleCommand("shot");
+	}
+}
+
+// A stock save game (a save fairy, the single-player game): the heroes' health is kept here and put back after the load (MPatcher saw it lost).
+event PreSaveGame()
+{
+	local KWPawn P;
+
+	// no Super: the Level Editor's engine classes the mod compiles against lack these two events (the stock game classes add nothing to them)
+	SavedHeroes.Length = 0;
+	SavedHealth.Length = 0;
+	foreach DynamicActors(Class'KWGame.KWPawn', P)
+	{
+		if (P.IsA('ShHeroPawn'))
+		{
+			SavedHeroes[SavedHeroes.Length] = P;
+			SavedHealth[SavedHealth.Length] = P.GetPropertyText("Health");
+		}
+	}
+	Log("[SDBG] save game: the health of " $ string(SavedHeroes.Length) $ " heroes is kept");
+}
+
+// After a stock load: the projectors placed in the level (light spots, marks; not the shadows) lost their link to the renderer (transient RenderInfo)
+// and are attached again; the heroes' health is put back. Both are logged, so a run shows whether the stock really lost them.
+event PostLoadGame(bool bLoadFromSaveGame)
+{
+	local Projector Pj;
+	local int i, nP, nA;
+	local string H, R;
+
+	if (!bLoadFromSaveGame || Off("mpatcher"))
+	{
+		return;
+	}
+	for (i = 0; i < SavedHeroes.Length; i++)
+	{
+		if (SavedHeroes[i] == None)
+		{
+			continue;
+		}
+		H = SavedHeroes[i].GetPropertyText("Health");
+		Log("[SDBG] load game: " $ string(SavedHeroes[i]) $ " health after the load " $ H $ ", at the save " $ SavedHealth[i]);
+		if (H != SavedHealth[i] && SavedHealth[i] != "")
+		{
+			SavedHeroes[i].SetPropertyText("Health", SavedHealth[i]);
+		}
+	}
+	foreach AllActors(Class'Engine.Projector', Pj)
+	{
+		if (Pj.IsA('ShadowProjector'))
+		{
+			continue;
+		}
+		nP++;
+		R = Pj.GetPropertyText("RenderInfo");
+		Log("[SDBG] load game: projector " $ string(Pj) $ " render info '" $ R $ "'");
+		if (R == "" || R == "0" || InStr(R, "=0)") >= 0)
+		{
+			Pj.AttachProjector();
+			nA++;
+		}
+	}
+	Log("[SDBG] load game: " $ string(nP) $ " projectors, " $ string(nA) $ " attached again");
+	if (bSaveTestDone)
+	{
+		SaveTestShotAt = Level.TimeSeconds + 3.0;
+	}
 }
 
 function SpawnSecond(PlayerController Host)
@@ -3854,7 +5453,7 @@ function SpawnSecond(PlayerController Host)
 		// no walkable place: in front of the host, then beside and behind him, whatever the floor looks like
 		for (i = 0; i < 56 && P2Pawn == None; i++)
 		{
-			if (ForcedSpot(JoinCenter, Host.Pawn.Rotation, i, Loc))
+			if (ForcedSpot(JoinCenter, HostHero(Host).Rotation, i, Loc))
 			{
 				P2Pawn = KWPawn(SpawnGuestPawn(Host, Loc));
 				if (P2Pawn != None)
@@ -3871,7 +5470,7 @@ function SpawnSecond(PlayerController Host)
 		return;
 	}
 	SpawnFails = 0;
-	T("spawn: attempt " $ string(i) $ " (1 = his place in the formation)" $ ", " $ string(int(VSize(P2Pawn.Location - Host.Pawn.Location))) $ " units from the host");
+	T("spawn: attempt " $ string(i) $ " (1 = his place in the formation)" $ ", " $ string(int(VSize(P2Pawn.Location - HostHero(Host).Location))) $ " units from the host");
 	T("spawn: Shrek for player two " $ string(P2Pawn) $ " at " $ string(P2Pawn.Location) $ ", controller " $ string(P2Pawn.Controller));
 	T("spawn: PlayerHeroActor before " $ HeroBefore $ ", after " $ Level.GetPropertyText("PlayerHeroActor"));
 	Old = P2Pawn.Controller;
@@ -3913,21 +5512,37 @@ function ShowSecond(PlayerController Host)
 	local int i;
 	local bool bPlaced;
 
-	for (i = 0; i < 40 && !bPlaced; i++)
+	// the host is free: a place next to him now (the centre chosen when the guest came in can be far behind by then). The host still watches his
+	// cutscene: the guest comes back where he stood before it.
+	if (Host.Pawn != None)
 	{
-		if (GuestSpot(Host, i, Loc))
+		ChooseJoinCenter(Host);
+		for (i = 0; i < 40 && !bPlaced; i++)
 		{
-			bPlaced = P2Pawn.SetLocation(Loc);
+			if (GuestSpot(Host, i, Loc))
+			{
+				bPlaced = P2Pawn.SetLocation(Loc);
+			}
 		}
 	}
 	P2Pawn.SetCollision(P2Pawn.default.bCollideActors, P2Pawn.default.bBlockActors, P2Pawn.default.bBlockPlayers);
 	P2Pawn.bHidden = false;
 	P2Pawn.SetPhysics(PHYS_Falling);
 	PendingPC.SetViewTarget(P2Pawn);
-	ChaseRotation(Host);
+	if (Host.Pawn != None)
+	{
+		ChaseRotation(Host);
+	}
 	PendingPC.ClientSetLocation(P2Pawn.Location, PendingPC.Rotation);
 	bP2Hidden = false;
-	T("cutscene over: the Shrek of player two is back at " $ string(P2Pawn.Location));
+	if (Host.Pawn == None)
+	{
+		T("own cutscene over: the Shrek of player two is back at " $ string(P2Pawn.Location) $ " (the host still watches his)");
+	}
+	else
+	{
+		T("cutscene over: the Shrek of player two is back at " $ string(P2Pawn.Location));
+	}
 }
 
 // From the heartbeat: makes, hides and shows player two's Shrek depending on whether the host is free.
@@ -3960,12 +5575,12 @@ function ChaseRotation(PlayerController Host)
 {
 	local Rotator R;
 
-	R = Host.Pawn.Rotation;   // the host's controller keeps an arbitrary yaw after a cutscene; his Shrek's facing is what the camera should follow
+	R = HostHero(Host).Rotation;   // the host's controller keeps an arbitrary yaw after a cutscene; his Shrek's facing is what the camera should follow
 	R.Pitch = -3000;
 	R.Roll = 0;
 	PendingPC.SetRotation(R);
 	PendingPC.ClientSetRotation(R);
-	T("chase camera: yaw " $ string(R.Yaw) $ " pitch " $ string(R.Pitch) $ ", host pawn " $ string(Host.Pawn.Location) $ ", player two " $ string(P2Pawn.Location) $ " radius " $ string(P2Pawn.default.CollisionRadius));
+	T("chase camera: yaw " $ string(R.Yaw) $ " pitch " $ string(R.Pitch) $ ", host pawn " $ string(HostHero(Host).Location) $ ", player two " $ string(P2Pawn.Location) $ " radius " $ string(P2Pawn.default.CollisionRadius));
 }
 
 // While the host has no Shrek of his own (a cutscene) or player two has none yet (or he is hidden), player two
@@ -3990,7 +5605,8 @@ function MirrorOne()
 	}
 	Guest = EnhancedPlayerController(PendingPC);
 	bFree = Host.Pawn != None;
-	if (bFree && P2Pawn != None && !bP2Hidden)
+	// a guest whose Shrek is in the world plays (also while the host still watches his cutscene): no mirrored camera
+	if (P2Pawn != None && !bP2Hidden)
 	{
 		if (Guest != None && (!Guest.bCutViewSentInit || Guest.bCutViewSent))
 		{
@@ -4047,6 +5663,30 @@ function MirrorOne()
 	}
 }
 
+// the current guest is still watching a cutscene of his own (his Shrek appears when he is back)
+function bool GuestInOwnCut()
+{
+	return EnhancedPlayerController(PendingPC) != None && EnhancedPlayerController(PendingPC).bLocalCutBusy;
+}
+
+// the current guest has played the host's cutscene now running and is back from it: he plays on while the host still watches
+function bool GuestDoneOwnCut()
+{
+	local EnhancedPlayerController G;
+
+	G = EnhancedPlayerController(PendingPC);
+	if (G == None || ActiveCut == None)
+	{
+		return false;
+	}
+	// he played the level's opening on his own machine before he joined
+	if (G.bIntroDone && bLevelHadOpening && CutSerial == OpeningSerial)
+	{
+		return true;
+	}
+	return bLocalCutOpt && G.LocalCutSent == CutSerial && !G.bLocalCutBusy;
+}
+
 function ManageOne()
 {
 	local PlayerController Host;
@@ -4064,24 +5704,23 @@ function ManageOne()
 	bFree = Host != None && Host.Pawn != None;
 	if (P2Pawn == None)
 	{
-		// the guests watch the opening cutscene with the host (his camera, see MirrorOne); their Shrek appears only when the cutscene is over and the
-		// host stands free on the start place of the level
-		if (bFree && !bHold && (ReleaseAt == 0.0 || Level.TimeSeconds - ReleaseAt > 4.0))
+		// The guests see the opening cutscene in their own game (or the host's camera, ?EnhOff=localcut); their Shrek appears when they are done with
+		// it, next to the host's hero, even if the host still watches (owner's rule: whoever is through his cutscene comes into the world)
+		if (Host != None && HostHero(Host) != None && !bHold && (ReleaseAt == 0.0 || Level.TimeSeconds - ReleaseAt > 4.0) && !GuestInOwnCut() && (bFree || GuestDoneOwnCut()))
 		{
 			SpawnSecond(Host);
 		}
 		return;
 	}
-	if (!bFree && !bP2Hidden && Host != None)
+	if (!bFree && !bP2Hidden && Host != None && !GuestDoneOwnCut())
 	{
 		HideSecond(Host);
 	}
-	else if (bFree && bP2Hidden)
+	else if (bP2Hidden && !GuestInOwnCut() && (bFree || GuestDoneOwnCut()))
 	{
 		ShowSecond(Host);
 	}
 }
-
 event PostLogin(PlayerController NewPlayer)
 {
 	local Class<HUD> HudClass;
@@ -4105,11 +5744,50 @@ event PostLogin(PlayerController NewPlayer)
 	{
 		ChangeName(NewPlayer, Class'Enhanced.EnhancedLobbySettings'.default.PlayerNick, false);
 	}
+	SendHostSong(EnhancedPlayerController(NewPlayer));
+	// a guest who comes into a level that began with an opening, and has not played it: he plays it by himself first and joins again after it
+	if (IsGuestPC(NewPlayer) && EnhancedPlayerController(NewPlayer) != None && !EnhancedPlayerController(NewPlayer).bIntroDone && bLevelHadOpening && !Off("introfirst"))
+	{
+		T("postlogin: " $ NewPlayer.PlayerReplicationInfo.PlayerName $ " has not seen the opening of " $ MapName() $ ": he plays it by himself first");
+		EnhancedPlayerController(NewPlayer).ClientIntroFirst(MapName());
+		AwayForIntro[AwayForIntro.Length] = NewPlayer.PlayerReplicationInfo.PlayerName;
+		IntroAway(NewPlayer.PlayerReplicationInfo.PlayerName);
+	}
 	T("postlogin: done");
 }
 
 defaultproperties
 {
+	OpeningMaps(0)="1_Shreks_Swamp"
+	OpeningMaps(1)="2_Carriage_Hijack"
+	OpeningMaps(2)="3_The_Hunt_Part1"
+	OpeningMaps(3)="4_FGM_Office"
+	OpeningMaps(4)="4_FGM_PIB"
+	OpeningMaps(5)="6_Hamlet"
+	OpeningMaps(6)="7_Prison_Donkey"
+	OpeningMaps(7)="8_Prison_PIB"
+	OpeningMaps(8)="9_Prison_Shrek"
+	OpeningMaps(9)="10_Castle_Siege"
+	OpeningMaps(10)="11_FGM_Battle"
+	OpeningMaps(11)="Beanstalk_bonus"
+	OpeningMaps(12)="Beanstalk_bonus_dawn"
+	OpeningMaps(13)="Beanstalk_bonus_knight"
+	IntroEnd(0)="10_Castle_Siege=-7.44,6218.19,303.62"
+	IntroEnd(1)="11_FGM_Battle=2176.14,5039.42,-981.20"
+	IntroEnd(2)="1_Shreks_Swamp=-12857.52,1089.40,-164.50"
+	IntroEnd(3)="2_Carriage_Hijack=-88.42,-1501.73,-5.50"
+	IntroEnd(4)="3_The_Hunt_Part1=4323.03,12646.69,45.39"
+	IntroEnd(5)="3_The_Hunt_Part2=-5116.98,12065.05,32.27"
+	IntroEnd(6)="3_The_Hunt_Part3=959.71,7469.90,147.19"
+	IntroEnd(7)="3_The_Hunt_Part4=866.52,-490.08,-596.17"
+	IntroEnd(8)="4_FGM_PIB=-744.96,-314.25,-1000.20"
+	IntroEnd(9)="5_FGM_Donkey=105.18,-2171.18,-997.25"
+	IntroEnd(10)="6_Hamlet=-2122.79,9870.43,-122.43"
+	IntroEnd(11)="6_Hamlet_End=-11165.84,60.54,351.15"
+	IntroEnd(12)="6_Hamlet_Mine=5059.34,2955.14,-1597.00"
+	IntroEnd(13)="7_Prison_Donkey=-1786.75,-2693.66,-104.25"
+	IntroEnd(14)="8_Prison_PIB=-839.92,-4304.51,279.80"
+	IntroEnd(15)="9_Prison_Shrek=-1621.21,-3564.85,298.84"
 	GamePortDefault=7777
 	LobbyMin=2
 	LobbyMax=4

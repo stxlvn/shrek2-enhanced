@@ -108,8 +108,122 @@ class Installer
             System.IO.File.Copy(path, c.Snapshot);
             ClearReadOnly(c.Snapshot);
         }
+        // the list of changes is on disk too, written after the copy is complete: a setup that was killed (closed from the task manager, a power cut)
+        // leaves it behind, and the next run puts the files back from it (RecoverInterrupted)
+        File.AppendAllText(Path.Combine(TxDir, Journal), Changes.Count + "\t" + (c.Existed ? 1 : 0) + "\t" + (int)c.Attr + "\t" + path + "\r\n", new UTF8Encoding(false));
         Changes.Add(c);
         Seen.Add(path, true);
+    }
+
+    const string Journal = "journal.txt";
+    const string TxPrefix = ".enhanced-txn-";
+    FileStream TxLock;
+
+    static bool IsUnder(string path, string dir)
+    {
+        if (string.IsNullOrEmpty(dir)) return false;
+        string full = Path.GetFullPath(path), root = Path.GetFullPath(dir).TrimEnd('\\') + "\\";
+        return full.StartsWith(root, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool Ru { get { return CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "ru"; } }
+
+    // A setup that was stopped half way (killed, a crash, a power cut) left its folder of original copies (.enhanced-txn-*) and maybe some temporary
+    // files. The originals are put back from the list of changes, in the reverse order, before anything else is done; then the folder goes. A folder that
+    // another running setup holds (its lock file is open) is left alone. A folder without a list (made by an older setup) cannot be put back and is removed.
+    void RecoverInterrupted()
+    {
+        if (!Directory.Exists(GameDir)) return;
+        foreach (string d in Directory.GetDirectories(GameDir, TxPrefix + "*"))
+        {
+            string lockFile = Path.Combine(d, "lock");
+            if (File.Exists(lockFile))
+            {
+                try { using (new FileStream(lockFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { } }
+                catch (IOException) { Log("Another setup is working on this game folder: its files are left alone."); continue; }
+            }
+            string j = Path.Combine(d, Journal);
+            int restored = 0;
+            if (File.Exists(j))
+            {
+                string[] lines = File.ReadAllLines(j, Encoding.UTF8);
+                List<string> errors = new List<string>();
+                for (int i = lines.Length - 1; i >= 0; i--)
+                {
+                    string[] f = lines[i].Split('\t');
+                    if (f.Length != 4) continue;
+                    string path = f[3], snap = Path.Combine(d, f[0] + ".bin");
+                    if (!IsUnder(path, GameDir) && !IsUnder(path, DocsDir)) continue;
+                    try
+                    {
+                        if (f[1] == "1")
+                        {
+                            if (!File.Exists(snap)) continue;
+                            string tmp = path + ".enhanced-tmp-" + Guid.NewGuid().ToString("N");
+                            try { File.Copy(snap, tmp, true); CommitTemp(tmp, path); }
+                            finally { SafeDelete(tmp); }
+                            int attr;
+                            if (int.TryParse(f[2], out attr)) { try { File.SetAttributes(path, (FileAttributes)attr); } catch { } }
+                        }
+                        else SafeDelete(path);
+                        restored++;
+                    }
+                    catch (Exception ex) { errors.Add(path + ": " + ex.Message); }
+                }
+                if (errors.Count > 0)
+                    throw new Exception((Ru ? "Не удалось вернуть файлы прерванной установки: " : "The files of an interrupted install could not be put back: ") + string.Join(" | ", errors.ToArray()) + Hint(new IOException()));
+                Log("An install that had been interrupted was undone first: " + restored + " files put back as they were before it.");
+            }
+            else Log("A leftover folder of an interrupted install (an older setup, no list of changes) was removed.");
+            Directory.Delete(d, true);
+        }
+        // temporary files of a write that was cut off
+        string[] dirs = { GameDir, Sys, TexDir, Path.Combine(DocsDir ?? "", "Shrek 2") };
+        foreach (string dir in dirs)
+        {
+            if (!Directory.Exists(dir)) continue;
+            foreach (string t in Directory.GetFiles(dir, "*.enhanced-tmp-*"))
+            {
+                try { SafeDelete(t); } catch { }
+            }
+        }
+    }
+
+    // Free room on the disk before anything is changed. The English HD textures make the texture packages about ten times bigger (1.9 GB instead of
+    // 0.16 GB, measured on the 1C edition), the originals are kept as backups and as the setup's own copies, and the biggest package is written next to
+    // itself first: about 2.7 GB on the game's disk. An HD pack given as a zip is unpacked into the temporary folder first (1.7 GB). SHREK2_SETUP_FREEMB
+    // pretends a free size (tests only).
+    void CheckFreeSpace(string textures, string hdPack)
+    {
+        const long MB = 1L << 20;
+        long game = 60 * MB, temp = 0;
+        if (textures == "enhd")
+        {
+            game += 2700 * MB;
+            if (!Directory.Exists(hdPack)) temp = 1800 * MB;
+        }
+        string gameRoot = Path.GetPathRoot(Path.GetFullPath(GameDir)), tempRoot = Path.GetPathRoot(Path.GetFullPath(Path.GetTempPath()));
+        if (string.Equals(gameRoot, tempRoot, StringComparison.OrdinalIgnoreCase)) { game += temp; temp = 0; }
+        NeedRoom(gameRoot, game);
+        if (temp > 0) NeedRoom(tempRoot, temp);
+    }
+
+    void NeedRoom(string root, long bytes)
+    {
+        long free;
+        string fake = Environment.GetEnvironmentVariable("SHREK2_SETUP_FREEMB");
+        long fakeMb;
+        if (!string.IsNullOrEmpty(fake) && long.TryParse(fake, out fakeMb)) free = fakeMb << 20;
+        else
+        {
+            try { free = new DriveInfo(root).AvailableFreeSpace; }
+            catch (Exception) { Log("Free space on " + root + " could not be read: not checked."); return; }
+        }
+        if (free >= bytes) return;
+        long needMb = (bytes >> 20) + 1, freeMb = free >> 20;
+        throw new Exception(Ru
+            ? "Недостаточно места на диске " + root + ": нужно примерно " + needMb + " МБ, свободно " + freeMb + " МБ. Освободите место и запустите установщик снова. Ничего не изменено."
+            : "Not enough room on " + root + ": about " + needMb + " MB are needed, " + freeMb + " MB are free. Make room and start the setup again. Nothing was changed.");
     }
 
     static void CommitTemp(string tmp, string path)
@@ -257,6 +371,7 @@ class Installer
     {
         if (!File.Exists(P("Engine.dll"))) throw new Exception("Engine.dll not found in " + Sys + ". Give the folder that contains the System folder of the game.");
         RequireGameClosed();
+        RecoverInterrupted();
         Restore(P("Engine.dll"), Log, "Engine.dll restored");
         Restore(P("Packages.md5"), Log, "Packages.md5 restored");
         Restore(P("Default.ini"), Log, "Default.ini restored");
@@ -323,11 +438,18 @@ class Installer
     // A failed install restores every file it touched, including files created during the attempt.
     public void Install(string textures, string hdPack, bool layer)
     {
-        TxDir = Path.Combine(GameDir, ".enhanced-txn-" + Guid.NewGuid().ToString("N"));
+        if (!File.Exists(P("Engine.dll"))) throw new Exception("Engine.dll not found in " + Sys + ". Give the folder that contains the System folder of the game.");
+        RequireGameClosed();
+        RecoverInterrupted();
+        CheckFreeSpace(textures, hdPack);
+        TxDir = Path.Combine(GameDir, TxPrefix + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(TxDir);
+        TxLock = new FileStream(Path.Combine(TxDir, "lock"), FileMode.Create, FileAccess.ReadWrite, FileShare.None);
         try
         {
             InstallCore(textures, hdPack, layer);
+            TxLock.Dispose();
+            TxLock = null;
             try { Directory.Delete(TxDir, true); } catch (Exception ex) { Log("Temporary install files left: " + ex.Message); }
             TxDir = null;
         }
@@ -339,10 +461,15 @@ class Installer
             try
             {
                 Rollback();
+                if (TxLock != null) { TxLock.Dispose(); TxLock = null; }
                 if (Directory.Exists(tx)) Directory.Delete(tx, true);
             }
             catch (Exception rb) { rollbackError = rb.Message; }
             throw new Exception("Installation failed: " + ex.Message + Hint(ex) + (rollbackError == "" ? " All changed files were restored." : " ROLLBACK FAILED: " + rollbackError));
+        }
+        finally
+        {
+            if (TxLock != null) { TxLock.Dispose(); TxLock = null; }
         }
     }
 
@@ -461,8 +588,8 @@ class Installer
     {
         string f = P("DefUser.ini");
         if (!File.Exists(f)) return;
-        Encoding enc = Encoding.GetEncoding(1252);
-        string text = File.ReadAllText(f, enc);
+        Encoding enc;
+        string text = ReadKeep(f, out enc);
         string next = Regex.Replace(text, @"(?m)^Enter=Use \| Fire[ \t]*(\r?)$", "Enter=$1");
         if (next == text) return;
         if (!File.Exists(f + Bak)) AtomicCopy(f, f + Bak);

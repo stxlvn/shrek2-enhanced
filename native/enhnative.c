@@ -1070,6 +1070,24 @@ static DWORD WINAPI pf_main(LPVOID unused)
 	if (!p)
 		return 0;
 	*p = 0;                                   /* the game's folder */
+	/* A second copy of the game on the same PC (a guest started next to the host, split tests) finds the files in the OS cache already: reading them
+	 * all again took the disk and the CPU from the running game (the host's cutscene stood still while the guest started). Only the first copy reads. */
+	{
+		char name[MAX_PATH + 32];
+		unsigned h = 5381;
+		const char *q;
+		HANDLE ev;
+		for (q = exe; *q; q++)
+			h = h * 33 + (unsigned char)(*q | 0x20);
+		snprintf(name, sizeof name, "Local\\EnhPrefetch_%08x", h);
+		ev = CreateEventA(NULL, TRUE, FALSE, name);
+		if (ev && GetLastError() == ERROR_ALREADY_EXISTS) {
+			enh_log("prefetch: another copy of the game from this folder runs, its files are cached: not read again");
+			CloseHandle(ev);
+			return 0;
+		}
+		/* the handle stays open for the life of this process: the next copy sees it */
+	}
 	g_pfStart = GetTickCount();
 	pf_add_dir(exe, "System", "*.u");
 	pf_add_dir(exe, "Animations", "*.ukx");
@@ -1337,6 +1355,604 @@ static void __attribute__((thiscall)) nat_canvasfont(void *self, FFrame *stack, 
 	}
 }
 
+/* ---- Several heroes: Level.PlayerHeroActor as seen by the code that reads it --------------------------------------------------
+ * The game is written for one hero: about 1400 places in its scripts (enemies choosing whom to fight, traps, save fairies, pick-ups, bosses, triggers)
+ * read LevelInfo.PlayerHeroActor, which is the host's hero. The scripts read an object's variable through the virtual machine's opcode
+ * EX_InstanceVariable (GNatives[0x01]); this hook watches that one opcode and, when the variable read is LevelInfo.PlayerHeroActor, gives back the
+ * hero that belongs to the code reading it:
+ *   - an object the mod names as belonging to a player (the host's controller, his HUD and camera; a guest's controller) gets that player's hero;
+ *   - a hero's own code gets the hero itself;
+ *   - any other actor (an enemy, its controller, a trap, a fairy, a coin) gets the nearest hero that can be fought (on his feet, not hidden): the
+ *     choice is kept for 1.5 s, so an enemy between two players does not turn from one to the other every frame;
+ *   - everything else (menus, cutscene actions, objects that are not actors) gets the real value.
+ * Writes to the variable are not touched (the opcode is then evaluated without a result buffer). The mod's game class fills the lists every frame
+ * (3530-3534); with no heroes listed (a client, a single-player game, ?EnhOff=heroes) every read gives the real value. */
+#define MAXHERO 8
+#define MAXOWNER 24
+static NativeFn orig_instvar;
+static void *g_heroProp;                       /* the UProperty LevelInfo.PlayerHeroActor */
+static void *g_actorClass, *g_ctlClass;
+static int g_locOfs = -1, g_pawnOfs = -1;      /* offsets of Actor.Location and Controller.Pawn */
+static void *g_hero[MAXHERO];
+static int g_nHero;
+static void *g_ownerObj[MAXOWNER], *g_ownerHero[MAXOWNER];
+static int g_nOwner;
+static struct { void *key; void *hero; DWORD t; } g_pick[256];
+static struct { void *node; int kind; } g_nodeKind[512];   /* function -> 1: an event whose first (or second) parameter is the actor it is about, 2: other */
+static const char *const g_pinNames[] = { "Touch", "UnTouch", "Bump", "Activate", "Trigger", "UnTrigger", "ProcessTouch", "AnnouncePickup",
+	"HitSHPawn", "HitSHPawnNoBone", "HeroTouched", "DamageEverybodyAround", NULL };
+static unsigned g_heroReads, g_heroSwaps;
+#define MAXHOSTFN 320
+static void *g_hostFn[MAXHOSTFN];             /* functions and states whose reads stay the host's hero (HUD, menus, saving, game-wide state) */
+static int g_nHostFn;
+#define MAXHOSTCLS 48
+static void *g_hostCls[MAXHOSTCLS];           /* classes whose code always reads the host's hero */
+static int g_nHostCls;
+typedef void *(__cdecl *FindObjFn)(void *cls, void *outer, const unsigned short *name, int exact);
+
+static int hero_listed(void *h)
+{
+	int i;
+	for (i = 0; i < g_nHero; i++)
+		if (g_hero[i] == h)
+			return 1;
+	return 0;
+}
+
+static void *hero_nearest(void *src)
+{
+	const float *a, *b;
+	float best = 0.0f, d, dx, dy, dz;
+	void *h = NULL;
+	int i;
+	if (g_locOfs < 0)
+		return NULL;
+	a = (const float *)((unsigned char *)src + g_locOfs);
+	for (i = 0; i < g_nHero; i++) {
+		b = (const float *)((unsigned char *)g_hero[i] + g_locOfs);
+		dx = a[0] - b[0]; dy = a[1] - b[1]; dz = a[2] - b[2];
+		d = dx * dx + dy * dy + dz * dz;
+		if (!h || d < best) {
+			best = d;
+			h = g_hero[i];
+		}
+	}
+	return h;
+}
+
+static int node_kind(void *node)
+{
+	unsigned slot = ((unsigned)(UINT_PTR)node >> 3) & 511;
+	const unsigned short *n;
+	int k = 2, i, j;
+	if (!node)
+		return 2;
+	if (g_nodeKind[slot].node == node)
+		return g_nodeKind[slot].kind;
+	n = fn_GetName ? fn_GetName(node) : NULL;
+	for (i = 0; n && g_pinNames[i]; i++) {
+		for (j = 0; g_pinNames[i][j] && n[j] == (unsigned short)g_pinNames[i][j]; j++)
+			;
+		if (!g_pinNames[i][j] && !n[j]) {
+			k = 1;
+			break;
+		}
+	}
+	g_nodeKind[slot].node = node;
+	g_nodeKind[slot].kind = k;
+	return k;
+}
+
+/* An event about an actor (a pawn touched a trap, a fairy, a pit; a trigger was activated by it; an enemy's blow hit it): when that actor is one of
+ * the heroes, the code of this object talks about him, not about the hero nearest to it. He stays its answer for 3 s (a pit fades and teleports him
+ * on timers after the touch).
+ * BreakableObject.DamageEverybodyAround is listed too: its first local is the pawn being hurt, and the stock code spares "the hero" (with several heroes
+ * it spared only the nearest one and hurt the others). */
+static void *hero_pinned(void *src, void *node, unsigned char *locals)
+{
+	void *a;
+	unsigned slot;
+	if (!locals || node_kind(node) != 1)
+		return NULL;
+	a = *(void **)locals;
+	if (!hero_listed(a)) {
+		a = *(void **)(locals + 4);
+		if (!hero_listed(a))
+			return NULL;
+	}
+	slot = ((unsigned)(UINT_PTR)src >> 4) & 255;
+	g_pick[slot].key = src;
+	g_pick[slot].hero = a;
+	g_pick[slot].t = GetTickCount() + 1500;   /* 1.5 s more than an ordinary choice: 3 s */
+	return a;
+}
+
+static void *hero_for(void *ctx, void *node, unsigned char *locals, void *real)
+{
+	void *src = ctx, *p, *h;
+	unsigned slot;
+	DWORD now;
+	int i;
+	if (!ctx)
+		return real;
+	for (i = 0; i < g_nHostFn; i++)
+		if (g_hostFn[i] == node)
+			return real;
+	for (i = 0; i < g_nOwner; i++)
+		if (g_ownerObj[i] == ctx)
+			return g_ownerHero[i] ? g_ownerHero[i] : real;
+	if (hero_listed(ctx))
+		return ctx;
+	if (!fn_IsA || !g_actorClass || !fn_IsA(ctx, g_actorClass))
+		return real;
+	for (i = 0; i < g_nHostCls; i++)
+		if (fn_IsA(ctx, g_hostCls[i]))
+			return real;
+	if (g_ctlClass && g_pawnOfs > 0 && fn_IsA(ctx, g_ctlClass)) {
+		p = *(void **)((unsigned char *)ctx + g_pawnOfs);
+		if (p) {
+			if (hero_listed(p))
+				return p;
+			src = p;
+		}
+	}
+	h = hero_pinned(src, node, locals);
+	if (h)
+		return h;
+	slot = ((unsigned)(UINT_PTR)src >> 4) & 255;
+	now = GetTickCount();
+	if (g_pick[slot].key == src && (int)(now - g_pick[slot].t) < 1500 && hero_listed(g_pick[slot].hero))
+		return g_pick[slot].hero;
+	h = hero_nearest(src);
+	if (!h)
+		return real;
+	g_pick[slot].key = src;
+	g_pick[slot].hero = h;
+	g_pick[slot].t = now;
+	return h;
+}
+
+static void __attribute__((thiscall)) hook_instvar(void *self, FFrame *stack, void *result)
+{
+	void *prop = *(void **)stack->code;
+	void *h;
+	orig_instvar(self, stack, result);
+	if (prop != g_heroProp || !g_heroProp || !result || g_nHero == 0)
+		return;
+	g_heroReads++;
+	h = hero_for(stack->object, stack->node, stack->locals, *(void **)result);
+	if (h != *(void **)result) {
+		g_heroSwaps++;
+		*(void **)result = h;
+	}
+}
+
+/* 3530 EnhHeroInit(Actor Probe, Controller C): finds the variable and the offsets (the probe's location and C's pawn are known to the script), puts the
+ * hook in. Returns 1 when everything is in place. */
+static int hero_init_done;
+static void __attribute__((thiscall)) nat_heroinit(void *self, FFrame *stack, void *result)
+{
+	void *probe = NULL, *ctl = NULL, *pawn = NULL;
+	float loc[3] = {0, 0, 0};
+	FindObjFn find;
+	void **table;
+	int i, ok = 0;
+	(void)self;
+	fn_Step(stack, stack->object, &probe);
+	fn_Step(stack, stack->object, &loc[0]);
+	fn_Step(stack, stack->object, &loc[1]);
+	fn_Step(stack, stack->object, &loc[2]);
+	fn_Step(stack, stack->object, &ctl);
+	fn_Step(stack, stack->object, &pawn);
+	stack->code++;
+	if (!hero_init_done) {
+		find = (FindObjFn)GetProcAddress(GetModuleHandleA("Core.dll"), "?StaticFindObject@UObject@@SAPAV1@PAVUClass@@PAV1@PBGH@Z");
+		g_actorClass = (void *)GetProcAddress(GetModuleHandleA("Engine.dll"), "?PrivateStaticClass@AActor@@0VUClass@@A");
+		g_ctlClass = (void *)GetProcAddress(GetModuleHandleA("Engine.dll"), "?PrivateStaticClass@AController@@0VUClass@@A");
+		if (find)
+			g_heroProp = find(NULL, (void *)-1, (const unsigned short *)L"Engine.LevelInfo.PlayerHeroActor", 0);
+		/* the offsets the engine itself keeps in the property objects (UProperty::Offset at +0x44 in this engine), each checked against the known
+		 * values; a search of the memory only when the check fails */
+		if (find && probe) {
+			unsigned char *lp = (unsigned char *)find(NULL, (void *)-1, (const unsigned short *)L"Engine.Actor.Location", 0);
+			if (lp) {
+				int o = *(int *)(lp + 0x44);
+				const float *f = (const float *)((unsigned char *)probe + o);
+				if (o > 0 && o < 0x800 && f[0] == loc[0] && f[1] == loc[1] && f[2] == loc[2])
+					g_locOfs = o;
+				enh_log("heroes: Actor.Location property says %#x (%s)", o, g_locOfs == o ? "checked" : "does not match");
+			}
+		}
+		if (find && ctl && pawn) {
+			unsigned char *pp = (unsigned char *)find(NULL, (void *)-1, (const unsigned short *)L"Engine.Controller.Pawn", 0);
+			if (pp) {
+				int o = *(int *)(pp + 0x44);
+				if (o > 0 && o < 0x1000 && *(void **)((unsigned char *)ctl + o) == pawn)
+					g_pawnOfs = o;
+				enh_log("heroes: Controller.Pawn property says %#x (%s)", o, g_pawnOfs == o ? "checked" : "does not match");
+			}
+		}
+		/* Actor.Location: three floats at the probe's known place */
+		if (probe && g_locOfs < 0) {
+			for (i = 0x30; i < 0x800; i += 4) {
+				const float *f = (const float *)((unsigned char *)probe + i);
+				if (f[0] == loc[0] && f[1] == loc[1] && f[2] == loc[2]) {
+					g_locOfs = i;
+					break;
+				}
+			}
+		}
+		/* Controller.Pawn: the first place in C that holds its pawn, after the actor's own variables (Location lies before them) */
+		if (ctl && pawn && g_locOfs > 0 && g_pawnOfs < 0) {
+			for (i = g_locOfs; i < 0x1000; i += 4)
+				if (*(void **)((unsigned char *)ctl + i) == pawn) {
+					g_pawnOfs = i;
+					break;
+				}
+		}
+		table = (void **)GetProcAddress(GetModuleHandleA("Core.dll"), "?GNatives@@3PAP8UObject@@AEXAAUFFrame@@QAX@ZA");
+		if (table && g_heroProp && g_locOfs > 0 && !orig_instvar) {
+			orig_instvar = (NativeFn)table[1];
+			table[1] = (void *)hook_instvar;
+		}
+		hero_init_done = 1;
+		enh_log("heroes: property %p, Location at %#x, Controller.Pawn at %#x, actor class %p, controller class %p, hook %s", g_heroProp, g_locOfs,
+			g_pawnOfs, g_actorClass, g_ctlClass, orig_instvar ? "in" : "NOT in");
+	}
+	ok = orig_instvar != NULL && g_heroProp != NULL;
+	*(int *)result = ok;
+}
+
+/* 3531 EnhHeroClear(): the lists are made again (every frame). 3532 EnhHeroAdd(Actor Hero): a hero that can be fought. 3533 EnhHeroOwner(Object O,
+ * Actor Hero): the object's reads give that hero. 3534 EnhHeroStats(): reads and swaps since the last call (for the log). */
+static void __attribute__((thiscall)) nat_heroclear(void *self, FFrame *stack, void *result)
+{
+	(void)self; (void)result;
+	stack->code++;
+	g_nHero = 0;
+	g_nOwner = 0;
+}
+
+static void __attribute__((thiscall)) nat_heroadd(void *self, FFrame *stack, void *result)
+{
+	void *h = NULL;
+	(void)self; (void)result;
+	fn_Step(stack, stack->object, &h);
+	stack->code++;
+	if (h && g_nHero < MAXHERO && !hero_listed(h))
+		g_hero[g_nHero++] = h;
+}
+
+static void __attribute__((thiscall)) nat_heroowner(void *self, FFrame *stack, void *result)
+{
+	void *o = NULL, *h = NULL;
+	(void)self; (void)result;
+	fn_Step(stack, stack->object, &o);
+	fn_Step(stack, stack->object, &h);
+	stack->code++;
+	if (o && g_nOwner < MAXOWNER) {
+		g_ownerObj[g_nOwner] = o;
+		g_ownerHero[g_nOwner] = h;
+		g_nOwner++;
+	}
+}
+
+static void __attribute__((thiscall)) nat_herostats(void *self, FFrame *stack, void *result)
+{
+	(void)self;
+	stack->code++;
+	*(int *)result = (int)(g_heroSwaps & 0x7fffffff);
+	enh_log("heroes: %u reads of PlayerHeroActor, %u gave another hero", g_heroReads, g_heroSwaps);
+	g_heroReads = 0;
+	g_heroSwaps = 0;
+}
+
+/* 3541 EnhHeroHost(string Path): the function, state or class named by its path ("SHGame.EnemyBoss.FadeInHealthBar", "KWGame.MovieTrigger") reads the
+ * host's hero: code that reaches the host's HUD, a movie, a menu, a save or the game's state through the hero must keep doing so. Returns 1 if found. */
+static void __attribute__((thiscall)) nat_herohost(void *self, FFrame *stack, void *result)
+{
+	struct { unsigned short *data; int num, max; } s = {NULL, 0, 0};
+	FindObjFn find;
+	void *o = NULL, *clsClass;
+	(void)self;
+	fn_Step(stack, stack->object, &s);
+	stack->code++;
+	find = (FindObjFn)GetProcAddress(GetModuleHandleA("Core.dll"), "?StaticFindObject@UObject@@SAPAV1@PAVUClass@@PAV1@PBGH@Z");
+	clsClass = (void *)GetProcAddress(GetModuleHandleA("Core.dll"), "?PrivateStaticClass@UClass@@0V1@A");
+	if (find && s.data && s.num > 1)
+		o = find(NULL, (void *)-1, s.data, 0);
+	*(int *)result = o != NULL;
+	{
+		int k;
+		for (k = 0; k < g_nHostFn; k++)
+			if (g_hostFn[k] == o)
+				o = NULL;
+		for (k = 0; o && k < g_nHostCls; k++)
+			if (g_hostCls[k] == o)
+				o = NULL;
+		if (!o && *(int *)result)
+			goto done;           /* known already (every level registers the list again) */
+	}
+	if (o && clsClass && fn_IsA && fn_IsA(o, clsClass)) {
+		if (g_nHostCls < MAXHOSTCLS)
+			g_hostCls[g_nHostCls++] = o;
+	} else if (o && g_nHostFn < MAXHOSTFN) {
+		g_hostFn[g_nHostFn++] = o;
+	}
+	if (!o)
+		enh_log("heroes: %ls not found", (const wchar_t *)s.data);
+done:
+	if (s.data) {
+		void **gm = (void **)GetProcAddress(GetModuleHandleA("Core.dll"), "?GMalloc@@3PAVFMalloc@@A");
+		void *m = gm ? *gm : NULL;
+		if (m)
+			((void (__attribute__((thiscall)) *)(void *, void *))(*(void ***)m)[2])(m, s.data);
+	}
+}
+
+/* ---- Spoken lines of the host's cutscene, not sent to a guest who plays his own --------------------------------------------------
+ * APlayerController::CheckHearSound (server) decides whether a player hears a sound played in the world and sends it to him. A guest who plays the
+ * cutscene himself (EnhancedPlayerController.StartLocalCut) speaks the same lines a little earlier or later: the host's lines (the sounds named pc_...)
+ * are not sent to him meanwhile. 3535 EnhDeaf(PlayerController PC, int On). */
+#define MAXDEAF 8
+static void *g_deaf[MAXDEAF];
+typedef void (__attribute__((thiscall)) *HearFn)(void *, void *, int, void *, float, float, float, float, int, int);
+static HearFn orig_CheckHearSound;
+
+static void __attribute__((thiscall)) hook_CheckHearSound(void *self, void *maker, int id, void *snd, float p0, float p1, float p2, float rsq, int a, int b)
+{
+	int i;
+	for (i = 0; i < MAXDEAF; i++)
+		if (g_deaf[i] == self && self && snd && fn_GetName) {
+			const unsigned short *n = fn_GetName(snd);
+			if (n && (n[0] == 'p' || n[0] == 'P') && (n[1] == 'c' || n[1] == 'C') && n[2] == '_')
+				return;
+			break;
+		}
+	orig_CheckHearSound(self, maker, id, snd, p0, p1, p2, rsq, a, b);
+}
+
+static void __attribute__((thiscall)) nat_deaf(void *self, FFrame *stack, void *result)
+{
+	void *pc = NULL;
+	int on = 0, i, free = -1;
+	(void)self; (void)result;
+	fn_Step(stack, stack->object, &pc);
+	fn_Step(stack, stack->object, &on);
+	stack->code++;
+	for (i = 0; i < MAXDEAF; i++) {
+		if (g_deaf[i] == pc) {
+			if (!on)
+				g_deaf[i] = NULL;
+			return;
+		}
+		if (!g_deaf[i] && free < 0)
+			free = i;
+	}
+	if (on && free >= 0)
+		g_deaf[free] = pc;
+}
+
+/* ---- The host's music for the guests -------------------------------------------------------------------------------------------
+ * Music is played by Actor.PlayMusic, a native that plays on the machine where it is called: every music change of the level (fights, potions,
+ * triggers, cutscenes) happened on the host only, a guest kept the level's first song. The audio subsystem's PlayMusic / StopMusic / StopAllMusic
+ * (ALAudio.dll) are watched here while 3536 EnhMusicWatch(1) is on (the host with guests); 3537 EnhMusicPoll() hands the script one change at a
+ * time as "kind|handle|fade|flags|song" (kind 1 play, 2 stop one, 3 stop all; "" when none) and the script sends it to the guests. */
+typedef int (__attribute__((thiscall)) *PlayMusicFn)(void *, unsigned short *, int, int, float, int);
+typedef int (__attribute__((thiscall)) *StopMusicFn)(void *, int, float);
+typedef int (__attribute__((thiscall)) *StopAllMusicFn)(void *, float);
+static PlayMusicFn orig_PlayMusic;
+static StopMusicFn orig_StopMusic;
+static StopAllMusicFn orig_StopAllMusic;
+static volatile int g_musicWatch;
+#define MUSQ 32
+static struct { int kind, handle, flags; float fade; unsigned short song[64]; } g_musq[MUSQ];
+static int g_musHead, g_musTail;
+static void *g_audio;                          /* this machine's audio subsystem (seen at its first PlayMusic) */
+
+static void mus_push(int kind, const unsigned short *song, int n, int handle, float fade, int flags)
+{
+	int i, next = (g_musHead + 1) % MUSQ;
+	if (next == g_musTail)
+		g_musTail = (g_musTail + 1) % MUSQ;     /* full: the oldest change is dropped */
+	g_musq[g_musHead].kind = kind;
+	g_musq[g_musHead].handle = handle;
+	g_musq[g_musHead].fade = fade;
+	g_musq[g_musHead].flags = flags;
+	for (i = 0; song && i < n && i < 63 && song[i]; i++)
+		g_musq[g_musHead].song[i] = song[i];
+	g_musq[g_musHead].song[i] = 0;
+	g_musHead = next;
+}
+
+static int __attribute__((thiscall)) hook_PlayMusic(void *self, unsigned short *data, int num, int max, float fade, int flags)
+{
+	unsigned short copy[64];
+	int i, r, n = 0;
+	for (i = 0; data && i < num && i < 63 && data[i]; i++)
+		copy[n++] = data[i];
+	copy[n] = 0;
+	g_audio = self;
+	r = orig_PlayMusic(self, data, num, max, fade, flags);    /* takes the string over */
+	if (g_musicWatch)
+		mus_push(1, copy, n, r, fade, flags);
+	return r;
+}
+
+static int __attribute__((thiscall)) hook_StopMusic(void *self, int handle, float fade)
+{
+	if (g_musicWatch)
+		mus_push(2, NULL, 0, handle, fade, 0);
+	return orig_StopMusic(self, handle, fade);
+}
+
+static int __attribute__((thiscall)) hook_StopAllMusic(void *self, float fade)
+{
+	if (g_musicWatch)
+		mus_push(3, NULL, 0, 0, fade, 0);
+	return orig_StopAllMusic(self, fade);
+}
+
+static void __attribute__((thiscall)) nat_musicwatch(void *self, FFrame *stack, void *result)
+{
+	int on = 0;
+	(void)self; (void)result;
+	fn_Step(stack, stack->object, &on);
+	stack->code++;
+	if (on && !g_musicWatch)
+		g_musHead = g_musTail = 0;
+	g_musicWatch = on && orig_PlayMusic && orig_StopMusic && orig_StopAllMusic;
+}
+
+/* The audio module is loaded by the engine after this DLL, during the engine's start and before any music plays: a thread puts the hooks in as soon
+ * as it is there, so the audio subsystem is known from the level's first song on. */
+static DWORD WINAPI mus_hook_thread(LPVOID unused)
+{
+	int i;
+	(void)unused;
+	for (i = 0; i < 24000 && !GetModuleHandleA("ALAudio.dll"); i++)
+		Sleep(5);
+	if (!GetModuleHandleA("ALAudio.dll"))
+		return 0;
+	hook_thunk("ALAudio.dll", "?PlayMusic@UALAudioSubsystem@@UAEHVFString@@MH@Z", (void *)hook_PlayMusic, (void **)&orig_PlayMusic);
+	hook_thunk("ALAudio.dll", "?StopMusic@UALAudioSubsystem@@UAEHHM@Z", (void *)hook_StopMusic, (void **)&orig_StopMusic);
+	hook_thunk("ALAudio.dll", "?StopAllMusic@UALAudioSubsystem@@UAEHM@Z", (void *)hook_StopAllMusic, (void **)&orig_StopAllMusic);
+	return 0;
+}
+
+/* a string handed back to a script is freed by the engine: it must come from the engine's own allocator (GMalloc) */
+typedef void *(__attribute__((thiscall)) *MallocFn)(void *, unsigned long, const unsigned short *);
+static void __attribute__((thiscall)) nat_musicpoll(void *self, FFrame *stack, void *result)
+{
+	char buf[160];
+	void **gm;
+	void *m;
+	unsigned short *w;
+	int n, i;
+	(void)self;
+	stack->code++;
+	/* the result buffer is not cleared by the engine: it may still hold the last string (already freed); it is always written */
+	((unsigned short **)result)[0] = NULL;
+	((int *)result)[1] = 0;
+	((int *)result)[2] = 0;
+	if (g_musTail == g_musHead)
+		return;
+	n = snprintf(buf, sizeof buf, "%d|%d|%.3f|%d|", g_musq[g_musTail].kind, g_musq[g_musTail].handle, g_musq[g_musTail].fade, g_musq[g_musTail].flags);
+	for (i = 0; g_musq[g_musTail].song[i] && n < (int)sizeof buf - 1; i++)
+		buf[n++] = (char)(g_musq[g_musTail].song[i] < 128 ? g_musq[g_musTail].song[i] : '?');
+	buf[n] = 0;
+	g_musTail = (g_musTail + 1) % MUSQ;
+	gm = (void **)GetProcAddress(GetModuleHandleA("Core.dll"), "?GMalloc@@3PAVFMalloc@@A");
+	if (!gm || !(m = *gm))
+		return;
+	w = (unsigned short *)((MallocFn)(*(void ***)m)[0])(m, (unsigned long)(n + 1) * 2, (const unsigned short *)L"EnhMusic");
+	if (!w)
+		return;
+	for (i = 0; i <= n; i++)
+		w[i] = (unsigned char)buf[i];
+	((unsigned short **)result)[0] = w;
+	((int *)result)[1] = n + 1;
+	((int *)result)[2] = n + 1;
+}
+
+/* 3538 EnhPlayMusic(string Song, float Fade, int Flags) -> handle, 3539 EnhStopMusic(int Handle, float Fade), 3540 EnhStopAllMusic(float Fade): a guest
+ * plays the host's music changes with the very flags the host's audio got (the script's own PlayMusic is declared otherwise in the older engine
+ * classes the mod is compiled against, so it is not called from the mod). EnhMusicWatch(0) on the guest puts the audio hooks in, so the audio
+ * subsystem is known after the level's first song. */
+typedef void (__attribute__((thiscall)) *FreeFn)(void *, void *);
+static void *eng_malloc(unsigned long n)
+{
+	void **gm = (void **)GetProcAddress(GetModuleHandleA("Core.dll"), "?GMalloc@@3PAVFMalloc@@A");
+	void *m;
+	if (!gm || !(m = *gm))
+		return NULL;
+	return ((MallocFn)(*(void ***)m)[0])(m, n, (const unsigned short *)L"EnhMusic");
+}
+
+static void eng_free(void *p)
+{
+	void **gm = (void **)GetProcAddress(GetModuleHandleA("Core.dll"), "?GMalloc@@3PAVFMalloc@@A");
+	void *m;
+	if (!p || !gm || !(m = *gm))
+		return;
+	((FreeFn)(*(void ***)m)[2])(m, p);
+}
+
+static void __attribute__((thiscall)) nat_playmusic(void *self, FFrame *stack, void *result)
+{
+	struct { unsigned short *data; int num, max; } s = {NULL, 0, 0};
+	float fade = 0.0f;
+	int flags = 0, n = 0, i;
+	unsigned short *copy;
+	(void)self;
+	fn_Step(stack, stack->object, &s);
+	fn_Step(stack, stack->object, &fade);
+	fn_Step(stack, stack->object, &flags);
+	stack->code++;
+	*(int *)result = -1;
+	while (s.data && n < s.num && s.data[n])
+		n++;
+	if (g_audio && orig_PlayMusic && n > 0 && (copy = (unsigned short *)eng_malloc((unsigned long)(n + 1) * 2)) != NULL) {
+		for (i = 0; i < n; i++)
+			copy[i] = s.data[i];
+		copy[n] = 0;
+		*(int *)result = orig_PlayMusic(g_audio, copy, n + 1, n + 1, fade, flags);   /* the audio takes the copy over */
+	}
+	eng_free(s.data);
+}
+
+static void __attribute__((thiscall)) nat_stopmusic(void *self, FFrame *stack, void *result)
+{
+	int h = 0;
+	float fade = 0.0f;
+	(void)self; (void)result;
+	fn_Step(stack, stack->object, &h);
+	fn_Step(stack, stack->object, &fade);
+	stack->code++;
+	if (g_audio && orig_StopMusic && h >= 0)
+		orig_StopMusic(g_audio, h, fade);
+}
+
+static void __attribute__((thiscall)) nat_stopallmusic(void *self, FFrame *stack, void *result)
+{
+	float fade = 0.0f;
+	(void)self; (void)result;
+	fn_Step(stack, stack->object, &fade);
+	stack->code++;
+	if (g_audio && orig_StopAllMusic)
+		orig_StopAllMusic(g_audio, fade);
+}
+
+/* ---- Leaving a network game for a level of one's own -------------------------------------------------------------------------
+ * A client that opens a level of its own (a guest who leaves to play a level's opening alone, or goes back to the menu) crashed the engine in
+ * UGameEngine::LoadMap: the loading screen (PaintProgress) draws the old network level once more, and its terrain can no longer read its data
+ * (General protection fault in ATerrainInfo::UpdateVertices <- CheckComputeDataOnLoad <- ... <- PaintProgress <- LoadingScreen <- LoadMap <- LocalMapURL).
+ * While this machine is a network client (3542 EnhNetClient(1), called every frame by the guest's controller; it lapses after 10 s) the loading
+ * screen is not drawn: the last picture stays until the new level is there. */
+typedef void (__attribute__((thiscall)) *VoidThisFn)(void *);
+static VoidThisFn orig_PaintProgress;
+static volatile DWORD g_netClientTick;
+static unsigned g_paintSkips;
+
+static void __attribute__((thiscall)) hook_PaintProgress(void *self)
+{
+	if (g_netClientTick && GetTickCount() - g_netClientTick < 10000) {
+		if (g_paintSkips++ < 3)
+			enh_log("loading screen of a network client not drawn (the old level's terrain would crash it)");
+		return;
+	}
+	orig_PaintProgress(self);
+}
+
+static void __attribute__((thiscall)) nat_netclient(void *self, FFrame *stack, void *result)
+{
+	int on = 0;
+	(void)self; (void)result;
+	fn_Step(stack, stack->object, &on);
+	stack->code++;
+	g_netClientTick = on ? (GetTickCount() | 1) : 0;
+}
+
 /* ---- Network: byte counters, and (tests only) packet loss and lag --------------------------------------------------------
  * IpDrv.dll sends and receives the game's UDP through WSOCK32 (sendto / recvfrom, imported by ordinal). Once IpDrv.dll is loaded a thread
  * replaces those two entries of its import table. Every second, while there is traffic, enhnative.log gets one "[NET]" line per process:
@@ -1563,6 +2179,19 @@ static void native_init(void)
 	register_native(table, 3511, nat_getsetting, undef);
 	register_native(table, 3512, nat_setsetting, undef);
 	register_native(table, 3520, nat_canvasfont, undef);
+	register_native(table, 3530, nat_heroinit, undef);
+	register_native(table, 3531, nat_heroclear, undef);
+	register_native(table, 3532, nat_heroadd, undef);
+	register_native(table, 3533, nat_heroowner, undef);
+	register_native(table, 3534, nat_herostats, undef);
+	register_native(table, 3535, nat_deaf, undef);
+	register_native(table, 3541, nat_herohost, undef);
+	register_native(table, 3542, nat_netclient, undef);
+	register_native(table, 3536, nat_musicwatch, undef);
+	register_native(table, 3537, nat_musicpoll, undef);
+	register_native(table, 3538, nat_playmusic, undef);
+	register_native(table, 3539, nat_stopmusic, undef);
+	register_native(table, 3540, nat_stopallmusic, undef);
 	{
 		HMODULE eng = GetModuleHandleA("Engine.dll");
 		if (eng)
@@ -1581,6 +2210,9 @@ static void native_init(void)
 		hook_thunk("Engine.dll", "?ReplicateAnim@AActor@@QAEXHVFName@@MMMMH@Z", (void *)hook_ReplicateAnim, (void **)&orig_ReplicateAnim);
 		hook_thunk("Engine.dll", "?eventPlayerCalcView@APlayerController@@QAEXAAPAVAActor@@AAVFVector@@AAVFRotator@@@Z", (void *)hook_PlayerCalcView, (void **)&orig_PlayerCalcView);
 		hook_thunk("Engine.dll", "?PlayReplicatedAnim@AActor@@QAEXXZ", (void *)hook_PlayReplicatedAnim, (void **)&orig_PlayReplicatedAnim);
+		hook_thunk("Engine.dll", "?CheckHearSound@APlayerController@@UAEXPAVAActor@@HPAVUSound@@VFVector@@MHH@Z", (void *)hook_CheckHearSound, (void **)&orig_CheckHearSound);
+		CreateThread(NULL, 0, mus_hook_thread, NULL, 0, NULL);
+		hook_thunk("Engine.dll", "?PaintProgress@UGameEngine@@UAEXXZ", (void *)hook_PaintProgress, (void **)&orig_PaintProgress);
 	}
 }
 

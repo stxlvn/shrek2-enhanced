@@ -53,6 +53,44 @@ function HitSHPawn(Actor HitActor, int HitDamage, array<Sound> SoundArray, Class
 	Super.HitSHPawn(HitActor, HitDamage, SoundArray, DamageType);
 }
 
+// Puss's sword notifies (the stock PIB events, not declared in the Level Editor's classes the mod compiles against) also run on a guest's machine,
+// where his copy has no sword: PIB.PostBeginPlay, which makes it, runs only on the server (run hv1: 794 "Accessed None" lines in the guest's log).
+// The same work as the stock events, the sword part skipped when there is no sword; the server's sword is replicated with its attachment.
+event AnimNotifySwordIsOut()
+{
+	if (PibSword == None)
+	{
+		return;
+	}
+	PibSword.WeaponAttachBone = PibSword.SecondaryWeaponAttachBone;
+	PibSword.WeaponAttachOffset = PibSword.SecondaryWeaponAttachOffset;
+	PibSword.WeaponAttachRotation = PibSword.SecondaryWeaponAttachRotation;
+	PibSword.AttachWeaponToKWPawn(self);
+	PibSword.bIsOut = true;
+}
+
+event AnimNotifySwordIsOutForPunch1()
+{
+	if (PibSword == None || PibSword.bIsOut)
+	{
+		return;
+	}
+	AnimNotifySwordIsOut();
+}
+
+event AnimNotifySwordIsIn()
+{
+	if (PibSword != None)
+	{
+		PibSword.WeaponAttachBone = PibSword.default.WeaponAttachBone;
+		PibSword.WeaponAttachOffset = PibSword.default.WeaponAttachOffset;
+		PibSword.WeaponAttachRotation = PibSword.default.WeaponAttachRotation;
+		PibSword.AttachWeaponToKWPawn(self);
+		PibSword.bIsOut = false;
+	}
+	DestroyRibbonEmitters();
+}
+
 defaultproperties
 {
 	bRotateToDesired=False

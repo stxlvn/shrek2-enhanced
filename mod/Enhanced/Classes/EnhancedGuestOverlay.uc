@@ -30,15 +30,33 @@ function PostRender(Canvas C)
 	{
 		Kit = new(None) Class'Enhanced.EnhancedHudKit';
 	}
+	// the guest's own cutscene speaks its own lines; the host's subtitle (sent by the server) belongs to the host's cutscene and is not shown meanwhile
+	if (P.bLocalCut)
+	{
+		if (P.LocalSubText != "" && P.Level.TimeSeconds < P.LocalSubUntil)
+		{
+			Kit.DrawSubtitle(C, P.LocalSubName, P.LocalSubText, P.LocalSubColor);
+		}
+		return;
+	}
 	if (P.SubText != "")
 	{
 		Kit.DrawSubtitle(C, Class'Enhanced.EnhancedText'.static.Decode(P.SubName), Class'Enhanced.EnhancedText'.static.Decode(P.SubText), P.SubColor);
+		return;
+	}
+	if (P.WaitNote != "")
+	{
+		Kit.DrawNoteAt(C, Class'Enhanced.EnhancedText'.static.Decode(P.WaitNote), 0.24);
 		return;
 	}
 	S = P.GateNote;
 	if (S == "")
 	{
 		S = P.DownNote;
+	}
+	if (S == "")
+	{
+		S = P.LeashNote;
 	}
 	S = Class'Enhanced.EnhancedText'.static.Decode(S);
 	if (S != "" && !P.bCutView)

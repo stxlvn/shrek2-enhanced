@@ -61,6 +61,11 @@ function DrawHUD(Canvas Canvas)
 	local KWPawn Inv;
 
 	Super.DrawHUD(Canvas);
+	// the world waits paused for a guest who still plays the opening (EnhancedGame.IntroWaitTick)
+	if (Kit != None && EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).IntroWaitNote != "")
+	{
+		Kit.DrawNoteAt(Canvas, EnhancedGame(Level.Game).IntroWaitNote, 0.24);
+	}
 	P = PlayerOwner.Pawn;
 	if (Kit == None || P == None || KWPawn(P) == None || bHideHUD || CutTextController.bCutSceneInProgress)
 	{

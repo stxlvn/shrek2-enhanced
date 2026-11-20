@@ -360,12 +360,18 @@ function DrawSubtitle(Canvas C, string Name, string Text, Color NameColor)
 // A note at the top of the screen.
 function DrawNote(Canvas C, string S)
 {
+	DrawNoteAt(C, S, 0.12);
+}
+
+// A note at a height (part of the screen's height); 0.24 is under the top row of the HUD (the potion box covers a long line at 0.12 on wide screens).
+function DrawNoteAt(Canvas C, string S, float Y)
+{
 	if (S == "" || C == None)
 	{
 		return;
 	}
 	C.Font = TextFont(C);
-	CentreLine(C, S, float(C.SizeY) * 0.12, 255, 255, 255);
+	CentreLine(C, S, float(C.SizeY) * Y, 255, 255, 255);
 }
 
 defaultproperties

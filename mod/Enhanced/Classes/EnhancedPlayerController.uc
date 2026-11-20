@@ -6,6 +6,7 @@ var int TravelTries;
 var string LastView;
 var float BotJumpHold;
 var config bool bTestBot;   // tests only: the client plays a fixed script of inputs (set in the test profile's User.ini)
+var config bool bTestSkipCut;   // tests only: the scripted guest skips his own cutscenes after 8 s
 var float BotTime;
 var Rotator MyView;
 var bool bViewInit;
@@ -13,6 +14,10 @@ var int DbgSet, DbgRot;
 var float SilenceTime;
 var string DownNote;     // set by the game: "you are down, wait for help" / "go to <name>"; the guest HUD draws it
 var string GateNote;     // set by the game while this player waits at a cutscene gate; the guest HUD draws it
+var string LeashNote;    // set by the game while this player is too far from his partners: the seconds before he is brought back
+var string WaitNote;     // set by the game while the world is paused for a guest who still plays the opening; the guest overlay draws it
+var float HeroJump, HeroDoubleJump;   // set by the game: the jump heights of this guest's hero on the server (the level's own, MPatcher's Steed)
+var float SwingFixAt;
 var config bool bTestReady;   // tests only (the test profile's User.ini): a guest presses Ready by himself
 var float ReadyClock;
 var config bool bHorPlus;     // widen the horizontal field of view with the aspect ratio (see EnhancedFov)
@@ -32,6 +37,7 @@ var int HudCoins;
 var int HudPotions;
 var int HudIcons;             // 1 + the shamrocks: the length of the health bar
 var int HudPotionSel;          // index of the selected potion, 9 = the timer
+var string HudExtra;           // what else the host's HUD shows: boss bar, game timer, potion timer (EnhancedGame.HostHudExtra)
 var bool bMenuCleaned;   // the menu pages of the level this guest came from were closed
 var bool bRoomOpened;   // a guest: the room page of the lobby has been opened
 var bool bLobbyReady;   // in the lobby: this guest pressed Ready (set on the server through ServerSetReady)
@@ -76,6 +82,39 @@ var bool bNickSent;            // the nickname of the lobby settings was sent to
 var float NickClock;
 var input float aArrowRight;   // the game binds the arrow keys to these two axes (see EnhancedInput)
 var input float aArrowUp;
+
+// ---- The guest's own cutscene (see StartLocalCut) ----
+var EnhancedLocalCut LocalCut;   // client: the cutscene playing on this machine
+var bool bLocalCut;              // client: a cutscene of its own is playing (the view, the subtitles and the skip key belong to it)
+var int LocalCutSerial;          // the number the server gave the cutscene (the answer ServerLocalCutDone carries it)
+var float LocalCutStart;
+var float HostCutEndedAt;        // client: when the server said the host's cutscene is over (0 = not yet)
+var Actor LocalCam;              // the local copy of the cutscene camera (the stock ShCam), whose view is the picture
+var array<Actor> CutClones;      // the local copies of the actors of the cutscene
+var array<Actor> CutHidden;      // the replicated actors the copies stand for, kept out of sight meanwhile
+var array<byte> CutHiddenDT;     // their draw types before
+var array<Actor> CutRenamed;     // replicated pawns whose tag or label the script would take for one of its actors
+var array<string> CutRenamedTag;
+var array<string> CutRenamedLabel;
+var array<string> CastTag, CastLabel, CastClass;   // the cast the server sent for the next cutscene (ClientCutCast)
+var array<Actor> CastSrc;
+var array<Vector> CastLoc;
+var array<Rotator> CastRot;
+var string SavedHeroActor;       // LevelInfo.PlayerHeroActor before the copies were made (a hero's copy takes it)
+var name TmpCutTag;
+var string LocalSubText, LocalSubName;
+var Color LocalSubColor;
+var float LocalSubUntil;
+var bool bIntroDone;             // server: he played this level's opening on his own machine before he joined (EnhancedGame.Login)
+var bool bIntroTravel;           // client: on his way to play a level's opening alone (the travel watch must not pull him back to the host)
+var bool bLocalCutBusy;          // server: this guest plays a cutscene of his own (his Shrek waits until he is back)
+var float LocalCutBusySince;     // server
+var int LocalCutSent;            // server: the number of the last cutscene sent to this guest
+var array<string> CutClasses;     // client: the classes of the cutscene's actors (the replicated pawns of these classes are hidden meanwhile)
+var float CutHideClock;
+var bool bBotCutSkipped;
+var float CutFovFrom, CutFovTo, CutFovStart, CutFovTime;
+var array<int> MusHostH, MusLocalH;   // client: the host's music handles and the ones of the same songs here   // client: the field of view of the guest's own cutscene (its FOV commands, see EnhancedCutFov)
 
 // Player two's controller. The game's own hero controllers (KWHeroController and below) rely on
 // actors that exist only on the server (the BaseCam camera, the HUD item pointers), so on a joined
@@ -125,6 +164,16 @@ event PlayerCalcView(out Actor ViewActor, out Vector CameraLocation, out Rotator
 		ViewActor = Self;
 		CameraLocation = MenuCamLoc;
 		CameraRotation = MenuLiveRot;
+		return;
+	}
+	// the guest's own cutscene: the picture is its camera's (the stock hero controller does the same with its BaseCam)
+	if (bLocalCut && BaseCam(LocalCam) != None)
+	{
+		ViewActor = Self;
+		CameraLocation = BaseCam(LocalCam).GetFinalLoc();
+		CameraRotation = BaseCam(LocalCam).GetFinalRot();
+		LastCamLoc = CameraLocation;
+		LastCamRot = CameraRotation;
 		return;
 	}
 	// the host's cutscene camera (a stand the server moves to where the host's camera is): the picture is exactly that place and angle, the third-person
@@ -298,6 +347,10 @@ event PreClientTravel()
 	local EnhancedTravelWatch W;
 
 	Class'Enhanced.EnhancedGame'.static.PatchWorldDefaults(self);
+	if (bLocalCut)
+	{
+		FinishLocalCut(false);
+	}
 	Super.PreClientTravel();
 	W = TravelWatch();
 	if (Level.NetMode == NM_Client && W == None && Player != None && Player.InteractionMaster != None)
@@ -305,7 +358,7 @@ event PreClientTravel()
 		W = EnhancedTravelWatch(Player.InteractionMaster.AddInteraction("Enhanced.EnhancedTravelWatch", Player));
 	}
 	Log("[SDBG] client: PreClientTravel, netmode " $ string(Level.NetMode) $ ", player " $ string(Player) $ ", watch " $ string(W));
-	if (Level.NetMode == NM_Client && W != None)
+	if (Level.NetMode == NM_Client && W != None && !bIntroTravel)
 	{
 		TravelHost = Level.GetAddressURL();
 		W.Arm(TravelHost, Self);
@@ -316,7 +369,11 @@ event PreClientTravel()
 replication
 {
 	reliable if (Role == ROLE_Authority)
-		ClientCutView, GateNote, DownNote, SubText, SubName, SubColor, HudCoins, HudPotions, HudPotionSel, HudIcons;
+		ClientCutCast, ClientLocalCut, ClientCutHostEnded, ClientMusic, ClientIntroFirst;
+	reliable if (Role < ROLE_Authority)
+		ServerLocalCutDone;
+	reliable if (Role == ROLE_Authority)
+		ClientCutView, GateNote, DownNote, LeashNote, WaitNote, HeroJump, HeroDoubleJump, SubText, SubName, SubColor, HudCoins, HudPotions, HudPotionSel, HudIcons, HudExtra;
 	reliable if (Role < ROLE_Authority)
 		ServerAction, ServerSetReady;
 	unreliable if (Role == ROLE_Authority && bNetOwner)
@@ -407,6 +464,12 @@ function BotInput(float DeltaTime)
 		Log("[SDBG] bot: scripted input starts");
 	}
 	BotTime += DeltaTime;
+	// the script runs again and again (walk, three attacks, turns, walk, jumps), so a long test keeps the guests moving and fighting
+	if (BotTime > 50.0)
+	{
+		BotTime = 5.0;
+		Log("[SDBG] bot: the script starts again");
+	}
 	if (BotTime > 10.0 && BotTime < 13.0)
 	{
 		aBaseY = 1200.0;                    // walk forward
@@ -710,7 +773,629 @@ function bool MenuIsOpen()
 
 exec function EscHandler()
 {
+	if (bLocalCut)
+	{
+		BypassCutscene();
+		return;
+	}
 	ShowInGameMenu();
+}
+
+// Space (the stock binding "BypassCutscene"): the guest skips his own cutscene, unless the script forbids it (NOBYPASS) like in the stock game.
+exec function BypassCutscene()
+{
+	if (bLocalCut && LocalCut != None)
+	{
+		LocalCut.ForceFinish();
+	}
+}
+
+// ==== The guest's own cutscene ===================================================================================================================
+// When a cutscene starts on the host, the server sends each guest its script and its cast: for every sequence the tag the script knows the actor by, the
+// actor itself (its replicated copy here, if this machine has it), its class and where it stands. The guest makes local copies of those actors (a replicated
+// class can be spawned on a client only with its RemoteRole put to none for the moment), keeps the replicated ones out of sight, and runs the stock script
+// on the copies: his own camera, his own sound and subtitles, at his own pace, skippable with Space. When it is over the copies go, the replicated actors
+// show again where the host's world has them now, and the server gets ServerLocalCutDone: his Shrek appears next to the host.
+
+// The host goes to a level that starts with an opening (or this guest came into one): the guest plays it in his own game first, as a single-player
+// game of that level, and joins the host again when it is over (EnhancedGame.IntroOnlyTick). The host's address is the one this machine reached.
+simulated function ClientIntroFirst(string Map)
+{
+	local string Addr, Cur;
+
+	if (Level.NetMode != NM_Client)
+	{
+		return;
+	}
+	Addr = Level.GetAddressURL();
+	bIntroTravel = true;
+	Log("[SDBG] client: plays the opening of " $ Map $ " by himself, then joins " $ Addr);
+	Cur = string(Level);
+	if (InStr(Cur, ".") > 0)
+	{
+		Cur = Left(Cur, InStr(Cur, "."));
+	}
+	if (Cur ~= Map)
+	{
+		// the same level as the one he is in on the host: through the menu book (see EnhancedGame.HopURL)
+		ConsoleCommand("open " $ Class'Enhanced.EnhancedGame'.static.HopURL("intro", Map, Addr));
+	}
+	else
+	{
+		ConsoleCommand("open " $ Map $ "?Game=Enhanced.EnhancedGame?EnhHop=?EnhIntroDone=?EnhIntroOnly=" $ Addr);
+	}
+}
+
+simulated function ClientCutCast(int i, string Tag, string Label, Actor Src, string ClassPath, Vector Loc, Rotator Rot)
+{
+	if (i == 0)
+	{
+		CastTag.Length = 0;
+		CastLabel.Length = 0;
+		CastClass.Length = 0;
+		CastSrc.Length = 0;
+		CastLoc.Length = 0;
+		CastRot.Length = 0;
+	}
+	CastTag[i] = Tag;
+	CastLabel[i] = Label;
+	CastClass[i] = ClassPath;
+	CastSrc[i] = Src;
+	CastLoc[i] = Loc;
+	CastRot[i] = Rot;
+}
+
+simulated function ClientLocalCut(string Script, string CutTag, int N, int Serial, bool bNoSkip)
+{
+	if (Level.NetMode != NM_Client)
+	{
+		return;
+	}
+	if (bLocalCut)
+	{
+		FinishLocalCut(false);
+	}
+	CastTag.Length = N;
+	StartLocalCut(Script, CutTag, Serial, bNoSkip);
+}
+
+simulated function ClientCutHostEnded(int Serial, float Length)
+{
+	if (Serial == LocalCutSerial)
+	{
+		HostCutEndedAt = Level.TimeSeconds;
+		Log("[LCUT] the host's cutscene is over (" $ string(int(Length)) $ " s); this one runs since " $ string(int(Level.TimeSeconds - LocalCutStart)) $ " s");
+	}
+}
+
+// server: the guest is back from his cutscene
+function ServerLocalCutDone(int Serial)
+{
+	if (Serial == LocalCutSent)
+	{
+		bLocalCutBusy = false;
+		if (EnhancedGame(Level.Game) != None)
+		{
+			EnhancedGame(Level.Game).EnhDeaf(self, 0);
+			EnhancedGame(Level.Game).SendHostSong(self);
+		}
+	}
+}
+
+// A change of the host's music ("kind|handle|fade|flags|song", see EnhancedGame.MusicTick), played here too. The guest's own cutscene has its own
+// music: the host's is not played meanwhile (the server does not send it, and one already on its way is dropped).
+native(3542) final function EnhNetClient(int On);
+native(3538) final function int EnhPlayMusic(string Song, float Fade, int Flags);
+native(3539) final function EnhStopMusic(int Handle, float Fade);
+native(3540) final function EnhStopAllMusic(float Fade);
+
+simulated function ClientMusic(string S)
+{
+	local int Kind, HostH, Flags, i, H;
+	local float Fade;
+	local string Song;
+
+	if (Level.NetMode != NM_Client || bLocalCut)
+	{
+		return;
+	}
+	Kind = int(Bar(S));
+	HostH = int(Bar(S));
+	Fade = float(Bar(S));
+	Flags = int(Bar(S));
+	Song = S;
+	if (Kind == 1 && Song != "")
+	{
+		H = EnhPlayMusic(Song, Fade, Flags);
+		i = MusHostH.Length;
+		MusHostH[i] = HostH;
+		MusLocalH[i] = H;
+		if (i > 30)
+		{
+			MusHostH.Remove(0, 1);
+			MusLocalH.Remove(0, 1);
+		}
+	}
+	else if (Kind == 2)
+	{
+		for (i = 0; i < MusHostH.Length; i++)
+		{
+			if (MusHostH[i] == HostH)
+			{
+				EnhStopMusic(MusLocalH[i], Fade);
+				MusHostH.Remove(i, 1);
+				MusLocalH.Remove(i, 1);
+				break;
+			}
+		}
+	}
+	else if (Kind == 3)
+	{
+		EnhStopAllMusic(Fade);
+		MusHostH.Length = 0;
+		MusLocalH.Length = 0;
+	}
+}
+
+simulated function string Bar(out string S)
+{
+	local int P;
+	local string R;
+
+	P = InStr(S, "|");
+	if (P < 0)
+	{
+		R = S;
+		S = "";
+		return R;
+	}
+	R = Left(S, P);
+	S = Mid(S, P + 1);
+	return R;
+}
+
+function bool IsCutClone(Actor A)
+{
+	local int i;
+
+	for (i = 0; i < CutClones.Length; i++)
+	{
+		if (CutClones[i] == A)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// a replicated class put to "not replicated" for the moment of the spawn (the engine refuses to spawn a replicated actor on a client)
+function Actor SpawnLocal(class<Actor> C, Vector Loc, Rotator Rot)
+{
+	local ENetRole Old, OldT;
+	local Actor A;
+
+	Old = C.default.RemoteRole;
+	OldT = Class'KWGame.BaseCamTarget'.default.RemoteRole;
+	C.default.RemoteRole = ROLE_None;
+	Class'KWGame.BaseCamTarget'.default.RemoteRole = ROLE_None;   // a camera makes its target in its BeginPlay
+	A = Spawn(C, Self, TmpCutTag, Loc, Rot);
+	if (A == None)
+	{
+		A = Spawn(C, Self, TmpCutTag, Loc + vect(0.0, 0.0, 40.0), Rot);
+	}
+	C.default.RemoteRole = Old;
+	Class'KWGame.BaseCamTarget'.default.RemoteRole = OldT;
+	return A;
+}
+
+function StartLocalCut(string Script, string CutTag, int Serial, bool bNoSkip)
+{
+	local int i, j, k;
+	local class<Actor> C;
+	local Actor A, S;
+	local Vector L;
+	local Rotator R;
+	local KWPawn P;
+	local bool bCast;
+
+	LocalCutSerial = Serial;
+	LocalCutStart = Level.TimeSeconds;
+	bBotCutSkipped = false;
+	HostCutEndedAt = 0.0;
+	LocalCam = None;
+	CutClones.Length = 0;
+	CutHidden.Length = 0;
+	CutHiddenDT.Length = 0;
+	CutRenamed.Length = 0;
+	CutRenamedTag.Length = 0;
+	CutRenamedLabel.Length = 0;
+	CutClasses.Length = 0;
+	SavedHeroActor = Level.GetPropertyText("PlayerHeroActor");
+	// the replicated pawns the script could take for one of its actors (a class's own tag is often the script's name for it: Shrek, Donkey, Camera)
+	// get another tag and label for the time of the cutscene
+	foreach DynamicActors(Class'KWGame.KWPawn', P)
+	{
+		bCast = false;
+		for (j = 0; j < CastTag.Length; j++)
+		{
+			if (string(P.Tag) ~= CastTag[j] || (CastLabel[j] != "" && P.GetPropertyText("Label") ~= CastLabel[j]))
+			{
+				bCast = true;
+			}
+		}
+		if (bCast)
+		{
+			k = CutRenamed.Length;
+			CutRenamed[k] = P;
+			CutRenamedTag[k] = string(P.Tag);
+			CutRenamedLabel[k] = P.GetPropertyText("Label");
+			P.Tag = 'EnhProxy';
+			P.SetPropertyText("Label", "EnhProxy");
+		}
+	}
+	for (i = 0; i < CastTag.Length; i++)
+	{
+		S = CastSrc[i];
+		C = None;
+		if (CastClass[i] != "")
+		{
+			C = class<Actor>(DynamicLoadObject(CastClass[i], Class'Core.Class'));
+		}
+		if (C == None && S != None)
+		{
+			C = S.Class;
+		}
+		if (C == None)
+		{
+			Log("[LCUT] no class for the actor '" $ CastTag[i] $ "' (" $ CastClass[i] $ ")");
+			continue;
+		}
+		L = CastLoc[i];
+		R = CastRot[i];
+		if (S != None)
+		{
+			L = S.Location;
+			R = S.Rotation;
+		}
+		SetPropertyText("TmpCutTag", CastTag[i]);
+		A = SpawnLocal(C, L, R);
+		if (A == None)
+		{
+			Log("[LCUT] the actor '" $ CastTag[i] $ "' (" $ string(C) $ ") could not be made at " $ string(L));
+			continue;
+		}
+		CutClones[CutClones.Length] = A;
+		CutClasses[CutClasses.Length] = string(A.Class);
+		A.SetPropertyText("Label", CastLabel[i]);
+		// a fresh copy plays nothing and would stand in the reference pose (T pose) until the script moves it: it takes the pose of the actor it
+		// stands for, or its own idle loop (the stock actors are idling when a cutscene takes them)
+		ClonePose(A, S);
+		A.SetCollision(false, false, false);
+		if (S != None)
+		{
+			if (S.Mesh != None && A.Mesh != S.Mesh)
+			{
+				A.LinkMesh(S.Mesh);
+			}
+			for (j = 0; j < S.Skins.Length; j++)
+			{
+				A.Skins[j] = S.Skins[j];
+			}
+			A.SetDrawScale(S.DrawScale);
+			k = CutHidden.Length;
+			CutHidden[k] = S;
+			CutHiddenDT[k] = S.DrawType;
+			S.SetDrawType(DT_None);
+		}
+		if (BaseCam(A) != None)
+		{
+			LocalCam = A;
+			if (BaseCam(A).CamTarget != None)
+			{
+				CutClones[CutClones.Length] = BaseCam(A).CamTarget;
+			}
+		}
+		Log("[LCUT] actor '" $ CastTag[i] $ "' = " $ string(A) $ " (" $ string(C) $ ") from " $ string(S));
+	}
+	HideCastProxies();
+	LocalCut = Spawn(Class'Enhanced.EnhancedLocalCut', Self);
+	if (LocalCut == None)
+	{
+		Log("[LCUT] the cutscene " $ Script $ " could not be made");
+		FinishLocalCut(true);
+		return;
+	}
+	LocalCut.Tag = 'EnhLocalCut';
+	LocalCut.ScriptFileName = Script;
+	LocalCut.Viewer = Self;
+	bLocalCut = true;
+	LocalSubText = "";
+	CutFovFrom = DefaultFOV;
+	CutFovTo = DefaultFOV;
+	CutFovTime = 0.0;
+	Log("[LCUT] start " $ Script $ " (" $ CutTag $ ") number " $ string(Serial) $ ", " $ string(CutClones.Length) $ " local actors, camera " $ string(LocalCam));
+	LocalCut.Trigger(Self, None);
+	if (bNoSkip)
+	{
+		LocalCut.bNoBypass = true;
+	}
+}
+
+// called by the cutscene when its last sequence is done (or it was skipped)
+function LocalCutOver(EnhancedLocalCut C)
+{
+	if (C == LocalCut)
+	{
+		FinishLocalCut(true);
+	}
+}
+
+function FinishLocalCut(bool bTellServer)
+{
+	local int i;
+	local EnhancedLocalCut C;
+
+	C = LocalCut;
+	LocalCut = None;
+	bLocalCut = false;
+	if (C != None)
+	{
+		if (!C.bEnded)
+		{
+			C.Viewer = None;
+			C.EndScene();
+		}
+		C.Destroy();
+	}
+	for (i = CutClones.Length - 1; i >= 0; i--)
+	{
+		if (CutClones[i] != None && !CutClones[i].bDeleteMe)
+		{
+			CutClones[i].Destroy();
+		}
+	}
+	CutClones.Length = 0;
+	LocalCam = None;
+	for (i = 0; i < CutHidden.Length; i++)
+	{
+		if (CutHidden[i] != None)
+		{
+			CutHidden[i].SetDrawType(EDrawType(CutHiddenDT[i]));
+		}
+	}
+	CutHidden.Length = 0;
+	CutHiddenDT.Length = 0;
+	CutClasses.Length = 0;
+	for (i = 0; i < CutRenamed.Length; i++)
+	{
+		if (CutRenamed[i] != None)
+		{
+			CutRenamed[i].SetPropertyText("Tag", CutRenamedTag[i]);
+			CutRenamed[i].SetPropertyText("Label", CutRenamedLabel[i]);
+		}
+	}
+	CutRenamed.Length = 0;
+	Level.SetPropertyText("PlayerHeroActor", SavedHeroActor);
+	LocalSubText = "";
+	bCutInit = false;
+	DesiredFOV = DefaultFOV;
+	FovAngle = DefaultFOV;
+	Log("[LCUT] over after " $ string(int(Level.TimeSeconds - LocalCutStart)) $ " s, the host's world is taken back");
+	if (bTellServer)
+	{
+		ServerLocalCutDone(LocalCutSerial);
+	}
+}
+
+// every frame of a cutscene of its own: the replicated actors stay out of sight (the host's world may show them again), and a cutscene still running long
+// after the host's has ended is stopped (it waits for something that will not come)
+function LocalCutTick()
+{
+	local int i;
+
+	if (!bLocalCut)
+	{
+		return;
+	}
+	if (LocalCut == None || LocalCut.bDeleteMe)
+	{
+		FinishLocalCut(true);
+		return;
+	}
+	for (i = 0; i < CutHidden.Length; i++)
+	{
+		if (CutHidden[i] != None && CutHidden[i].DrawType != DT_None)
+		{
+			CutHiddenDT[i] = CutHidden[i].DrawType;
+			CutHidden[i].SetDrawType(DT_None);
+		}
+	}
+	// the host's world sends more of its actors as they come within reach: those of the cutscene's classes are hidden too
+	CutHideClock += 1.0;
+	if (CutHideClock >= 15.0)
+	{
+		CutHideClock = 0.0;
+		HideCastProxies();
+	}
+	DesiredFOV = CutFovNow();
+	FovAngle = DesiredFOV;
+	// tests only (bTestSkipCut in the test profile): the scripted guest skips his own cutscene after 8 s (the skip key's path). Off by default: a skip
+	// plays the rest of the scene at once, the actors jump to their last places, which looked like the guest's scene hurrying after the host's.
+	if (bTestBot && bTestSkipCut && !bBotCutSkipped && Level.TimeSeconds - LocalCutStart > 8.0)
+	{
+		bBotCutSkipped = true;
+		Log("[LCUT] bot: skips the cutscene");
+		BypassCutscene();
+	}
+	if (Level.TimeSeconds - LocalCutStart > 600.0 || (HostCutEndedAt > 0.0 && Level.TimeSeconds - HostCutEndedAt > 120.0))
+	{
+		Log("[LCUT] stopped: it ran too long");
+		FinishLocalCut(true);
+	}
+}
+
+// The replicated actors the cutscene's copies stand for: every pawn of the host's world of the same class as a copy is kept out of sight (the actor sent
+// with the cast is not always known on this machine yet: then only its class tells which one it is). Without this the guest saw each actor twice, the
+// copy playing his cutscene and the host's actor playing the host's.
+function HideCastProxies()
+{
+	local KWPawn P;
+	local int j, k;
+	local bool bCast, bHad;
+
+	if (CutClasses.Length == 0)
+	{
+		return;
+	}
+	foreach DynamicActors(Class'KWGame.KWPawn', P)
+	{
+		if (P.DrawType == DT_None || IsCutClone(P) || P == Pawn)
+		{
+			continue;
+		}
+		bCast = false;
+		for (j = 0; j < CutClasses.Length; j++)
+		{
+			if (string(P.Class) ~= CutClasses[j])
+			{
+				bCast = true;
+				break;
+			}
+		}
+		if (!bCast)
+		{
+			continue;
+		}
+		bHad = false;
+		for (k = 0; k < CutHidden.Length; k++)
+		{
+			if (CutHidden[k] == P)
+			{
+				bHad = true;
+				break;
+			}
+		}
+		if (!bHad)
+		{
+			k = CutHidden.Length;
+			CutHidden[k] = P;
+			CutHiddenDT[k] = P.DrawType;
+		}
+		CutHiddenDT[k] = P.DrawType;
+		P.SetDrawType(DT_None);
+	}
+}
+
+function ClonePose(Actor A, Actor S)
+{
+	local name N;
+	local float F, R;
+
+	if (S != None)
+	{
+		S.GetAnimParams(0, N, F, R);
+	}
+	if ((N == 'None' || !A.HasAnim(N)) && KWPawn(A) != None)
+	{
+		N = KWPawn(A).GetIdleAnimName();
+	}
+	if (N == 'None' || !A.HasAnim(N))
+	{
+		N = 'Idle';
+	}
+	if (A.HasAnim(N))
+	{
+		A.LoopAnim(N, 1.0, 0.0);
+	}
+}
+
+// the script's FOV command: the angle goes from where it is to NewFov in Time seconds (bReset: back to the player's own angle)
+function CutFovChange(float NewFov, float Time, bool bReset)
+{
+	CutFovFrom = CutFovNow();
+	if (bReset || NewFov < 5.0)
+	{
+		NewFov = DefaultFOV;
+	}
+	CutFovTo = FClamp(NewFov, 5.0, 170.0);
+	CutFovStart = Level.TimeSeconds;
+	CutFovTime = FMax(Time, 0.0);
+}
+
+function float CutFovNow()
+{
+	local float K;
+
+	if (CutFovTime <= 0.0)
+	{
+		return CutFovTo;
+	}
+	K = FClamp((Level.TimeSeconds - CutFovStart) / CutFovTime, 0.0, 1.0);
+	K = K * K * (3.0 - 2.0 * K);
+	return CutFovFrom + (CutFovTo - CutFovFrom) * K;
+}
+
+// where a line is heard from when the script names no actor for it: the camera of the cutscene (the stock game plays it on the hero's camera)
+function Actor CutSoundSource()
+{
+	if (LocalCam != None)
+	{
+		return LocalCam;
+	}
+	return Self;
+}
+
+// a spoken line of the guest's own cutscene: the speaker comes from the dialog key (pc_<speaker>_...), the colours are those of EnhancedCutText
+function LocalSubtitle(string DlgID, string Txt, float Seconds)
+{
+	local string Code;
+	local int P;
+
+	Code = Mid(DlgID, InStr(DlgID, "_") + 1);
+	P = InStr(Code, "_");
+	if (P > 0)
+	{
+		Code = Left(Code, P);
+	}
+	LocalSubName = Localize("Name", Code, "Enhanced");
+	if (Left(LocalSubName, 2) == "<?")
+	{
+		LocalSubName = "";
+	}
+	LocalSubColor = SpeakerColor(Code);
+	LocalSubText = Txt;
+	LocalSubUntil = Level.TimeSeconds + Seconds;
+}
+
+function Color SpeakerColor(string Code)
+{
+	local Color C;
+
+	C.A = 255;
+	switch (Code)
+	{
+		case "shk":
+			C.R = 195; C.G = 225; C.B = 155;
+			break;
+		case "dnk":
+			C.R = 235; C.G = 208; C.B = 165;
+			break;
+		case "pib":
+			C.R = 245; C.G = 195; C.B = 130;
+			break;
+		case "fin":
+			C.R = 245; C.G = 190; C.B = 212;
+			break;
+		case "fgm":
+			C.R = 215; C.G = 192; C.B = 245;
+			break;
+		case "nar":
+			C.R = 195; C.G = 210; C.B = 245;
+			break;
+		default:
+			C.R = 245; C.G = 232; C.B = 175;
+	}
+	return C;
 }
 
 exec function ShowInGameMenu()
@@ -770,6 +1455,27 @@ function ShowReturnToFEYesNo()
 	ClientOpenMenu("Enhanced.EnhancedGuestReturn");
 }
 
+// A guest's machine predicts his own moves: his hero's copy here gets the server's jump heights (the level's own values, the Steed's 128), and the
+// swinging stones and balls here get the server's smaller hit cylinder (MPatcher's fix), every two seconds.
+simulated function ClientHeroValues()
+{
+	local KWPawn K;
+
+	K = KWPawn(Pawn);
+	if (K != None && HeroDoubleJump > 0.0 && (K.fDoubleJumpHeight != HeroDoubleJump || K.fJumpHeight != HeroJump))
+	{
+		K.fJumpHeight = HeroJump;
+		K.fDoubleJumpHeight = HeroDoubleJump;
+		K.SetJumpVars();
+		Log("[SDBG] client: jump heights of " $ string(K) $ " from the server: " $ string(HeroJump) $ " / " $ string(HeroDoubleJump));
+	}
+	if (Level.TimeSeconds > SwingFixAt)
+	{
+		SwingFixAt = Level.TimeSeconds + 2.0;
+		Class'Enhanced.EnhancedGame'.static.FixSwings(self);
+	}
+}
+
 event PlayerTick(float DeltaTime)
 {
 	local string S;
@@ -777,8 +1483,16 @@ event PlayerTick(float DeltaTime)
 	// A guest always plays in the third person. The engine puts bBehindView back from Pawn.PointOfView() whenever it restarts the controller
 	// (ClientReStart / Restart), and with it off the pawn is not drawn for its owner (bOwnerNoSee): the Shrek of the guest vanished from his own screen.
 	bBehindView = true;
+	// tells the engine layer that this machine is a network client: the loading screen of the next level change is not drawn (enhnative.c, it
+	// crashed the engine when a guest left for a level of his own)
+	if (Level.NetMode == NM_Client)
+	{
+		EnhNetClient(1);
+		ClientHeroValues();
+	}
 	UndoHorPlus();
 	Super.PlayerTick(DeltaTime);
+	LocalCutTick();
 	HeroGround();
 	bBehindView = true;
 	if (bCutView && CutFov > 10.0)
@@ -921,6 +1635,20 @@ event PlayerTick(float DeltaTime)
 // He walks the way the camera looks (the game's own heroes do the same through their camera).
 state PlayerWalking
 {
+	// while his own cutscene plays the guest does not walk (his Shrek stands in the host's world meanwhile)
+	function PlayerMove(float DeltaTime)
+	{
+		if (bLocalCut)
+		{
+			aForward = 0.0;
+			aStrafe = 0.0;
+			aBaseY = 0.0;
+			aUp = 0.0;
+			bPressedJump = false;
+		}
+		Super.PlayerMove(DeltaTime);
+	}
+
 	function Rotator GetRotationForPawnMove()
 	{
 		local Rotator R;
@@ -939,6 +1667,10 @@ event ClientMessage(coerce string S, optional Name Type)
 
 exec function Fire(optional float F)
 {
+	if (bLocalCut)
+	{
+		return;
+	}
 	ServerAction();
 }
 

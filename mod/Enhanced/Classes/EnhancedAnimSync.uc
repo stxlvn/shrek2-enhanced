@@ -27,6 +27,8 @@ var float FreshAge[24];
 var array<Actor> Seen;      // client: every pawn looked at once
 var float FreshClock;
 var float ProbeClock;
+var int TPoseLogs;
+var float UnposedAt[32];
 
 native(3501) final function int EnhAnimExtra(Actor A, int Ch);
 native(3502) final function EnhAnimSyncOn(int On);
@@ -108,7 +110,9 @@ simulated function string Field(out string S, string Sep)
 	return R;
 }
 
-simulated function Apply(Actor P, string D, int Slot)
+// bFresh: the pawn has just been given this slot. Its one-shot is started only when it plays something else; the epoch of the record is taken
+// over as it is (the slot's last epoch belonged to another pawn, and the difference restarted the animation from its first frame).
+simulated function Apply(Actor P, string D, int Slot, optional bool bFresh)
 {
 	local string Rec, Nm;
 	local int C, Al, Loop, Ep, K;
@@ -144,7 +148,7 @@ simulated function Apply(Actor P, string D, int Slot)
 		}
 		K = Slot * ChannelCount + C;
 		P.GetAnimParams(C, CN, CF, CR);
-		bStart = (CN != TmpName) || (Loop != 0 && !P.IsAnimating(C)) || (Loop == 0 && Ep != AppliedEpoch[K]);
+		bStart = (CN != TmpName) || (Loop != 0 && !P.IsAnimating(C)) || (!bFresh && Loop == 0 && Ep != AppliedEpoch[K]);
 		AppliedEpoch[K] = Ep;
 		if (bStart)
 		{
@@ -454,6 +458,21 @@ simulated function bool Listed(Actor P)
 	return false;
 }
 
+// server: the pawn is in the set chosen by the last SelectSet
+function bool Picked(Actor P)
+{
+	local int i;
+
+	for (i = 0; i < MaxHeroes; i++)
+	{
+		if (Pick[i] == P)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 simulated function ClearPawn(Actor P)
 {
 	local int C;
@@ -576,7 +595,8 @@ simulated function HideUnposed(float DeltaTime)
 simulated event Tick(float DeltaTime)
 {
 	local Actor K;
-	local int i, N;
+	local int i, j, N;
+	local bool bFresh;
 
 	Clock += DeltaTime;
 	LogClock += DeltaTime;
@@ -605,20 +625,48 @@ simulated event Tick(float DeltaTime)
 			SelClock = 0.0;
 			SelectSet();
 		}
+		// A pawn keeps its slot as long as it stays in the set. The slots used to be filled again from the start every time, so when one pawn left
+		// (a guest hidden for a cutscene, a creature out of range) every pawn after it moved one slot down: its record then met the frames and
+		// epochs of the slot's previous pawn, here and on the clients, and its attack or jump started again from the first frame (a jerk).
 		for (i = 0; i < MaxHeroes; i++)
 		{
-			K = Pick[i];
-			if (K != None && !K.bDeleteMe && !K.bHidden)
+			K = Who[i];
+			if (K != None && (K.bDeleteMe || K.bHidden || !Picked(K)))
 			{
-				Who[N] = K;
-				Data[N] = Pack(K, N);
-				N++;
+				Who[i] = None;
+				Data[i] = "";
 			}
 		}
-		for (i = N; i < MaxHeroes; i++)
+		for (j = 0; j < MaxHeroes; j++)
 		{
-			Who[i] = None;
-			Data[i] = "";
+			K = Pick[j];
+			if (K == None || K.bDeleteMe || K.bHidden || Listed(K))
+			{
+				continue;
+			}
+			for (i = 0; i < MaxHeroes; i++)
+			{
+				if (Who[i] == None)
+				{
+					break;
+				}
+			}
+			if (i >= MaxHeroes)
+			{
+				break;
+			}
+			Who[i] = K;
+			for (N = 0; N < ChannelCount; N++)
+			{
+				PrevF[i * ChannelCount + N] = 0.0;
+			}
+		}
+		for (i = 0; i < MaxHeroes; i++)
+		{
+			if (Who[i] != None)
+			{
+				Data[i] = Pack(Who[i], i);
+			}
 		}
 		return;
 	}
@@ -638,17 +686,43 @@ simulated event Tick(float DeltaTime)
 			AppliedWho[i] = None;
 			Applied[i] = "";
 		}
-		if (Who[i] != None && (Data[i] != Applied[i] || Who[i] != AppliedWho[i] || ForceClock > 2.0))
+		bFresh = Who[i] != AppliedWho[i];
+		if (Who[i] != None && (Data[i] != Applied[i] || bFresh || ForceClock > 2.0 || Unposed(Who[i], i)))
 		{
 			Applied[i] = Data[i];
 			AppliedWho[i] = Who[i];
-			Apply(Who[i], Data[i], i);
+			Apply(Who[i], Data[i], i, bFresh);
 		}
 	}
 	if (ForceClock > 2.0)
 	{
 		ForceClock = 0.0;
 	}
+}
+
+// Client: a player's hero with nothing on channel 0 stands in the reference pose (the T pose). The record that would pose him is applied again at
+// once instead of at the next two-second refresh, and the case is written to the log (a few lines per level) so a test run shows whether it happens.
+simulated function bool Unposed(Actor P, int Slot)
+{
+	local name N;
+	local float F, R;
+
+	if (P == None || P.bHidden || Pawn(P) == None || Pawn(P).PlayerReplicationInfo == None || Left(Data[Slot], 2) != "0:" || Level.TimeSeconds - UnposedAt[Slot] < 0.25)
+	{
+		return false;
+	}
+	P.GetAnimParams(0, N, F, R);
+	if (N != 'None')
+	{
+		return false;
+	}
+	UnposedAt[Slot] = Level.TimeSeconds;
+	if (TPoseLogs < 20)
+	{
+		TPoseLogs++;
+		Log("[TPOSE] t=" $ string(Level.TimeSeconds) $ " " $ string(P.Name) $ " slot " $ string(Slot) $ " had nothing on channel 0, record " $ Left(Data[Slot], 120));
+	}
+	return true;
 }
 
 defaultproperties

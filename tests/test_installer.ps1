@@ -144,6 +144,49 @@ try {
     Remove-Item "$sys\d3d8_real.dll", "$sys\d3d8_real.dll.enhanced-made" -Force -ErrorAction SilentlyContinue
     SameAsBase 'after the read-only checks'
 
+    $noRoom = 'Not enough room|' + (-join [char[]](0x41D, 0x435, 0x434, 0x43E, 0x441, 0x442, 0x430, 0x442, 0x43E, 0x447, 0x43D, 0x43E))
+    # not enough room on the disk: refused before anything changes (SHREK2_SETUP_FREEMB pretends the free size)
+    $env:SHREK2_SETUP_FREEMB = '10'
+    Run @('/silent', '/dir', $game, '/textures', 'ru')
+    Remove-Item Env:SHREK2_SETUP_FREEMB
+    Assert ($code -eq 1) 'install is refused when the disk is full'
+    Assert ($text -match $noRoom) ('the message names the room -- got: ' + $text)
+    SameAsBase 'after the refused install (no room)'
+    $env:SHREK2_SETUP_FREEMB = '1000'
+    Run @('/silent', '/dir', $game, '/textures', 'enhd', '/hdpack', "$w\no-such-pack.zip")
+    Remove-Item Env:SHREK2_SETUP_FREEMB
+    Assert ($code -eq 1) 'the HD install is refused with 1 GB free'
+    Assert ($text -match $noRoom) ('the HD message names the room -- got: ' + $text)
+    SameAsBase 'after the refused HD install (no room)'
+
+    # a setup killed half way: the next run puts back what it had changed (its list of changes) and removes its leftovers
+    $tx = "$game\.enhanced-txn-killedtest"
+    New-Item -ItemType Directory $tx | Out-Null
+    Copy-Item "$sys\Default.ini" "$tx\0.bin"
+    $j = "0`t1`t32`t$sys\Default.ini`r`n1`t0`t0`t$sys\Enhanced.u`r`n"
+    [IO.File]::WriteAllText("$tx\journal.txt", $j, (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::AppendAllText("$sys\Default.ini", "`r`n[HalfWritten]`r`nX=1`r`n")
+    [IO.File]::WriteAllBytes("$sys\Enhanced.u", [byte[]](1, 2, 3))
+    [IO.File]::WriteAllBytes("$sys\Engine.dll.enhanced-tmp-0123", [byte[]](4, 5, 6))
+    Run @('/silent', '/dir', $game, '/uninstall'); Assert ($code -eq 0) 'removal after a killed setup'
+    Assert ($text -match 'interrupted') ('the log tells about the interrupted install -- got: ' + $text)
+    Assert (-not (Test-Path $tx)) 'the folder of the killed setup is gone'
+    SameAsBase 'after the recovery of a killed setup'
+    # a leftover of an older setup (no list of changes) is removed; a folder another running setup holds is left alone
+    New-Item -ItemType Directory "$game\.enhanced-txn-oldformat" | Out-Null
+    [IO.File]::WriteAllBytes("$game\.enhanced-txn-oldformat\0.bin", [byte[]](7))
+    $tx2 = "$game\.enhanced-txn-busytest"
+    New-Item -ItemType Directory $tx2 | Out-Null
+    $fs = [IO.File]::Open("$tx2\lock", 'Create', 'ReadWrite', 'None')
+    try {
+        Run @('/silent', '/dir', $game, '/uninstall'); Assert ($code -eq 0) 'removal with an old leftover and a busy folder'
+        Assert (-not (Test-Path "$game\.enhanced-txn-oldformat")) 'the old leftover folder is removed'
+        Assert (Test-Path $tx2) 'the folder of a running setup is left alone'
+    }
+    finally { $fs.Dispose() }
+    Remove-Item $tx2 -Recurse -Force
+    SameAsBase 'after the leftover-folder checks'
+
     if ($HdPack) {
         $pack = $HdPack
         New-Item -ItemType Directory "$sys\d3d8.dll" | Out-Null

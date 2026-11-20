@@ -102,6 +102,14 @@ function bool CheckReplacement(Actor Other, out byte bSuperRelevant)
 		}
 	}
 
+	// A pick-up shows itself only within its radius of the HOST's camera (KWPickup.CheckForDistance, it hides and shrinks it; bHidden goes to the guests):
+	// a guest away from the host saw no coins at all. In a co-op game the check is off and the engine's own culling by distance does it instead, for each
+	// player's own camera (the stock game does the same for the software renderer).
+	if (Level.NetMode == NM_ListenServer && Other.IsA('KWPickup') && Other.GetPropertyText("bCheckForDistance") ~= "True")
+	{
+		Other.SetPropertyText("bCheckForDistance", "False");
+		Other.SetPropertyText("CullDistance", Other.GetPropertyText("PickupRadius"));
+	}
 	// A hint cutscene (the Donkey's "walk on the water" talk and the like) fires again every time any hero steps on its trigger.
 	// With two heroes wading in and out it repeated ten times; one repeat per 40 seconds at most.
 	if (Other.IsA('CutSceneTrigger') && float(Other.GetPropertyText("ReTriggerDelay")) < 40.0)

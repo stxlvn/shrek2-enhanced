@@ -16,6 +16,8 @@ var float PageSince;
 var bool bDumped;
 var int FitLogs;
 var GUIController ColoredFor;     // the menu controller whose stock styles got the readable inactive colour
+var Tab_Options VideoPage;        // the settings page whose two video lists are ours (see VideoLists)
+var bool bVideoFilling;           // our lists are being filled: their change events are not a player's choice
 
 // Put on a player's viewport once (the interactions stay across level changes; a controller is made again in every level).
 static function Ensure(PlayerController P)
@@ -34,6 +36,188 @@ static function Ensure(PlayerController P)
 		}
 	}
 	P.Player.InteractionMaster.AddInteraction("Enhanced.EnhancedMenuFit", P.Player);
+}
+
+// ---- The video tab's two repurposed lists, on the host's and the guests' settings page alike ----
+// "Colour depth" (32 or 16 bit) became the anti-aliasing and the hidden renderer row the anisotropic filtering; both apply at once through a change of
+// the resolution to the current one (the engine layer asks Direct3D for them when the device is made again). The stock page disables the renderer list
+// when it starts (MenuStateChange(MSAT_Disabled): owner 2026-11-21, "the anisotropy does not open"), and it writes the bit depth and the renderer back
+// into both lists when it refreshes after a change of resolution (the change event then came to a controller whose page was gone: Accessed None). The
+// lists are ours again on every frame the page is open; a text that is not one of ours is replaced by the current value.
+native(3511) final function int EnhGetSetting(int Id);
+native(3512) final function EnhSetSetting(int Id, int Value);
+
+function string AAText(int Samples)
+{
+	if (Samples < 2)
+	{
+		return Localize("Menu", "Off", "Enhanced");
+	}
+	return string(Samples) $ "x";
+}
+
+function int AAIndex(int Samples)
+{
+	if (Samples >= 8)
+	{
+		return 3;
+	}
+	if (Samples >= 4)
+	{
+		return 2;
+	}
+	if (Samples >= 2)
+	{
+		return 1;
+	}
+	return 0;
+}
+
+function int AFIndex(int Level)
+{
+	if (Level >= 16)
+	{
+		return 3;
+	}
+	if (Level >= 8)
+	{
+		return 2;
+	}
+	if (Level >= 4)
+	{
+		return 1;
+	}
+	return 0;
+}
+
+// the value of a text of our lists, -1 for any other text (the samples of the anti-aliasing: 0, 2, 4, 8; the anisotropy: 1, 4, 8, 16)
+function int ListValue(string T, bool bAF)
+{
+	if (T == AAText(0))
+	{
+		if (bAF)
+		{
+			return 1;
+		}
+		return 0;
+	}
+	if (T == "2x" && !bAF)
+	{
+		return 2;
+	}
+	if (T == "4x")
+	{
+		return 4;
+	}
+	if (T == "8x")
+	{
+		return 8;
+	}
+	if (T == "16x" && bAF)
+	{
+		return 16;
+	}
+	return -1;
+}
+
+function VideoLists(Tab_Options Page)
+{
+	local Tab_OptionsVideo V;
+
+	V = Page.VideoTab;
+	if (V == None || V.cbColorDepth == None || V.cbRenderer == None)
+	{
+		return;
+	}
+	if (Page != VideoPage)
+	{
+		VideoPage = Page;
+		bVideoFilling = true;
+		V.lblColorDepth.Caption = Localize("Menu", "AA", "Enhanced");
+		V.lblRenderer.Caption = Localize("Menu", "AF", "Enhanced");
+		V.lblRenderer.bVisible = true;
+		V.cbRenderer.bVisible = true;
+		V.cbRenderer.Edit.bVisible = true;
+		V.cbColorDepth.OnChange = AAChanged;
+		V.cbRenderer.OnChange = AFChanged;
+		V.cbColorDepth.List.Clear();
+		V.cbColorDepth.AddItem(AAText(0));
+		V.cbColorDepth.AddItem("2x");
+		V.cbColorDepth.AddItem("4x");
+		V.cbColorDepth.AddItem("8x");
+		V.cbColorDepth.SetIndex(AAIndex(EnhGetSetting(1)));
+		V.cbRenderer.List.Clear();
+		V.cbRenderer.AddItem(AAText(0));
+		V.cbRenderer.AddItem("4x");
+		V.cbRenderer.AddItem("8x");
+		V.cbRenderer.AddItem("16x");
+		V.cbRenderer.SetIndex(AFIndex(EnhGetSetting(2)));
+		bVideoFilling = false;
+		Log("[SDBG] settings: AA=" $ string(EnhGetSetting(1)) $ " AF=" $ string(EnhGetSetting(2)) $ " dxvk=" $ string(EnhGetSetting(3)) $ " on " $ string(Page));
+	}
+	if (V.cbRenderer.MenuState == MSAT_Disabled || V.cbRenderer.MyShowListBtn.MenuState == MSAT_Disabled)
+	{
+		Log("[SDBG] settings: the anisotropy list was disabled by the stock page (states " $ string(int(V.cbRenderer.MenuState)) $ "/" $ string(int(V.cbRenderer.MyShowListBtn.MenuState)) $ "): enabled");
+		V.cbRenderer.MenuStateChange(MSAT_Blurry);
+		V.cbRenderer.Edit.MenuStateChange(MSAT_Blurry);
+		V.cbRenderer.MyShowListBtn.MenuStateChange(MSAT_Blurry);
+	}
+	if (ListValue(V.cbColorDepth.GetText(), false) < 0)
+	{
+		bVideoFilling = true;
+		V.cbColorDepth.SetIndex(AAIndex(EnhGetSetting(1)));
+		bVideoFilling = false;
+	}
+	if (ListValue(V.cbRenderer.GetText(), true) < 0)
+	{
+		bVideoFilling = true;
+		V.cbRenderer.SetIndex(AFIndex(EnhGetSetting(2)));
+		bVideoFilling = false;
+	}
+}
+
+function ApplyVideoNow()
+{
+	if (ViewportOwner != None && ViewportOwner.Actor != None)
+	{
+		ViewportOwner.Actor.ConsoleCommand("SETRES " $ ViewportOwner.Actor.ConsoleCommand("GetCurrentRes"));
+	}
+}
+
+function AAChanged(GUIComponent Sender)
+{
+	local int V;
+
+	if (bVideoFilling || GUIComboBox(Sender) == None)
+	{
+		return;
+	}
+	V = ListValue(GUIComboBox(Sender).GetText(), false);
+	if (V < 0 || V == EnhGetSetting(1))
+	{
+		return;
+	}
+	Log("[SDBG] settings: anti-aliasing " $ string(V) $ " chosen");
+	EnhSetSetting(1, V);
+	ApplyVideoNow();
+}
+
+function AFChanged(GUIComponent Sender)
+{
+	local int V;
+
+	if (bVideoFilling || GUIComboBox(Sender) == None)
+	{
+		return;
+	}
+	V = ListValue(GUIComboBox(Sender).GetText(), true);
+	if (V < 0 || V == EnhGetSetting(2))
+	{
+		return;
+	}
+	Log("[SDBG] settings: anisotropy " $ string(V) $ " chosen");
+	EnhSetSetting(2, V);
+	ApplyVideoNow();
 }
 
 // how wide a style draws a text at this canvas, in pixels (enhnative.c: the style's own UGUIStyles::TextSize)
@@ -89,6 +273,7 @@ function PostRender(Canvas C)
 	if (Tab_Options(GC.ActivePage) != None)
 	{
 		ShortKeyNames(Tab_Options(GC.ActivePage).GameTab);
+		VideoLists(Tab_Options(GC.ActivePage));
 	}
 	FitAll(C, GC, GC.ActivePage.Controls, 0);
 	if (!bDumped && P.Level.TimeSeconds - PageSince > 1.0 && P.Level.Game != None && EnhancedGame(P.Level.Game) != None && EnhancedGame(P.Level.Game).bMenuDump)

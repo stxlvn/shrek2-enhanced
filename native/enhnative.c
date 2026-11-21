@@ -107,17 +107,76 @@ static void patch_module(HMODULE mod)
 typedef struct { void *vtbl; void *node; void *object; unsigned char *code; unsigned char *locals; } FFrame;
 typedef void (__attribute__((thiscall)) *NativeFn)(void *self, FFrame *stack, void *result);
 
+/* enhnative.log lies in Documents\Shrek 2, next to the game's own Game.log (SHREK2_DOCS in tests), and starts anew with every start of the game: the
+ * log of the start before is kept as enhnative.old.log. It used to be appended to forever in the game's System folder, which a player without the
+ * rights to Program Files cannot write (Windows then puts it into VirtualStore or nowhere). The folder is looked up on the first line written outside
+ * DllMain (shell32 must not be loaded under the loader lock); lines written before that wait in memory. */
+static const char g_logName[] = "enhnative.log";
+static char g_logPath[MAX_PATH];
+static int g_logState;                  /* 0 not looked up yet, 1 path known */
+static int g_inDllMain;
+static char g_logEarly[16384];
+static size_t g_logEarlyLen;
+static CRITICAL_SECTION g_logLock;
+static int g_logLockReady;
+
+static void log_find_path(void)
+{
+	char dir[MAX_PATH], old[MAX_PATH];
+	DWORD k = GetEnvironmentVariableA("SHREK2_DOCS", dir, MAX_PATH);
+	g_logState = 1;
+	if (k == 0 || k >= MAX_PATH) {
+		HMODULE sh = LoadLibraryA("shell32.dll");
+		HRESULT (WINAPI *get)(HWND, int, HANDLE, DWORD, LPSTR) = sh ? (void *)GetProcAddress(sh, "SHGetFolderPathA") : NULL;
+		if (!get || get(NULL, 5, NULL, 0, dir) != 0) {
+			snprintf(g_logPath, sizeof g_logPath, "%s", g_logName);
+			return;
+		}
+	}
+	snprintf(g_logPath, sizeof g_logPath, "%s\\Shrek 2", dir);
+	CreateDirectoryA(g_logPath, NULL);
+	snprintf(old, sizeof old, "%s\\Shrek 2\\enhnative.old.log", dir);
+	snprintf(g_logPath, sizeof g_logPath, "%s\\Shrek 2\\%s", dir, g_logName);
+	MoveFileExA(g_logPath, old, MOVEFILE_REPLACE_EXISTING);
+}
+
 static void enh_log(const char *fmt, ...)
 {
-	FILE *f = fopen("enhnative.log", "a");
+	char line[1200];
 	va_list ap;
-	if (!f)
-		return;
+	int n;
+	FILE *f;
 	va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
+	n = vsnprintf(line, sizeof line - 2, fmt, ap);
 	va_end(ap);
-	fputc(10, f);
-	fclose(f);
+	if (n < 0)
+		return;
+	if (n > (int)sizeof line - 3)
+		n = (int)sizeof line - 3;
+	line[n++] = 10;
+	line[n] = 0;
+	if (g_logLockReady)
+		EnterCriticalSection(&g_logLock);
+	if (g_inDllMain) {
+		if (g_logEarlyLen + (size_t)n < sizeof g_logEarly) {
+			memcpy(g_logEarly + g_logEarlyLen, line, (size_t)n);
+			g_logEarlyLen += (size_t)n;
+		}
+	} else {
+		if (!g_logState)
+			log_find_path();
+		f = fopen(g_logPath, "ab");
+		if (f) {
+			if (g_logEarlyLen) {
+				fwrite(g_logEarly, 1, g_logEarlyLen, f);
+				g_logEarlyLen = 0;
+			}
+			fwrite(line, 1, (size_t)n, f);
+			fclose(f);
+		}
+	}
+	if (g_logLockReady)
+		LeaveCriticalSection(&g_logLock);
 }
 
 static void __attribute__((thiscall)) nat_version(void *self, FFrame *stack, void *result)
@@ -196,22 +255,6 @@ static void __attribute__((thiscall)) hook_PlayReplicatedAnim(void *self)
 	}
 }
 
-typedef void (__attribute__((thiscall)) *ReplicateAnimFn)(void *, int, int, float, float, float, float, int);
-static ReplicateAnimFn orig_ReplicateAnim;
-
-/* AActor::ReplicateAnim(int channel, FName seq, float, float, float, float, int loop), called by the engine on the machine that plays the animation. */
-static void __attribute__((thiscall)) hook_ReplicateAnim(void *self, int ch, int name, float f4, float f5, float f6, float f7, int loop)
-{
-	static int n;
-	if (n < 80 && ch == 0 && fn_GetName) {
-		const unsigned short *nm = fn_GetName(self);
-		if (nm && nm[0] == 'S' && nm[1] == 'h' && nm[2] == 'r') {
-			n++;
-			enh_log("ReplicateAnim %ls: name %d  f4 %.3f f5 %.3f f6 %.3f f7 %.3f loop %d", (const wchar_t *)nm, name, f4, f5, f6, f7, loop);
-		}
-	}
-	orig_ReplicateAnim(self, ch, name, f4, f5, f6, f7, loop);
-}
 
 /* ---- Natives for the animation sync (EnhancedAnimSync in the mod's scripts) -----------------------------------
  * 3501 EnhAnimExtra(Actor A, int Channel): what the scripts cannot read: bit 0 = the channel loops, bits 1..8 = its blend alpha (0..255).
@@ -353,6 +396,7 @@ static void __attribute__((thiscall)) hook_PlayerCalcView(void *self, void *a, v
 static int g_noPrefetch;     /* Prefetch=False in Game.ini */
 static int g_msaa;           /* multisample count to ask Direct3D for (MSAA=N in Game.ini) */
 static int g_maxfps;         /* frame limiter: MaxFPS=N in Game.ini (0 = none); the game's physics was made for about 60 steps a second */
+static int g_noBorderless;   /* Borderless=False in Game.ini: the engine's full screen stays an exclusive full-screen device */
 typedef struct {
 	char cpu[64];
 	int logical, ramMB, vramMB, monW, monH, monHz, vendor;
@@ -607,6 +651,8 @@ static void hw_tune(void)
 	len = (size_t)sz;
 	if (strstr(buf, "Prefetch=False"))
 		g_noPrefetch = 1;
+	if (strstr(buf, "Borderless=False"))
+		g_noBorderless = 1;
 	{
 		const char *f = strstr(buf, "MaxFPS=");
 		g_maxfps = f ? atoi(f + 7) : 0;
@@ -746,7 +792,8 @@ static int g_msaaLogged;
 /* D3DPRESENT_PARAMETERS of Direct3D 8 as DWORDs: 0 width, 1 height, 2 back buffer format, 3 back buffer count, 4 multisample type, 5 swap effect,
  * 6 window, 7 windowed, 8 auto depth stencil, 9 its format, 10 flags, 11 refresh rate, 12 presentation interval. */
 /* The system's Direct3D 8 cannot read a multisampled back buffer: the engine's ReadPixels (the loading screen's picture, screenshots) fails with
- * "LockRect failed: D3DERR_INVALIDCALL". DXVK resolves it. So multisampling is asked for only when d3d8_real.dll is DXVK's. */
+ * "LockRect failed: D3DERR_INVALIDCALL". DXVK resolves it; on the system's Direct3D 8 the refused lock is answered from the front buffer (my_SurfLock). */
+static int g_readPixelsHooked;      /* the system's Direct3D 8: a refused lock of the multisampled back buffer is answered from the front buffer (my_SurfLock) */
 static int g_isDxvk = -1;
 static int real_is_dxvk(void)
 {
@@ -774,7 +821,7 @@ static int real_is_dxvk(void)
 	}
 	free(b);
 	fclose(f);
-	enh_log("d3d8_real.dll is %s: multisampling %s", g_isDxvk ? "DXVK" : "the system's Direct3D 8", g_isDxvk ? "allowed" : "switched off (a multisampled back buffer cannot be read there)");
+	enh_log("d3d8_real.dll is %s", g_isDxvk ? "DXVK" : "the system's Direct3D 8");
 	return g_isDxvk;
 }
 
@@ -782,7 +829,7 @@ static void msaa_fix_params(DWORD *pp)
 {
 	void **vt;
 	DWORD fmt;
-	if (g_msaa < 2 || !real_is_dxvk() || !g_d3d || !pp || pp[4] != 0)
+	if (g_msaa < 2 || (!real_is_dxvk() && !g_readPixelsHooked) || !g_d3d || !pp || pp[4] != 0)
 		return;
 	vt = *(void ***)g_d3d;
 	fmt = pp[2] ? pp[2] : 22;           /* D3DFMT_X8R8G8B8 when the windowed mode takes the desktop format */
@@ -797,10 +844,423 @@ static void msaa_fix_params(DWORD *pp)
 	}
 }
 
+/* The device of the game, its window and its sample count (for ReadPixels below), and what happened to it: every CreateDevice and Reset with its
+ * parameters and result, every change of the result of Present and TestCooperativeLevel (Alt+Tab out of full screen loses the device). */
+static void *g_dev;
+static HWND g_devWnd;
+static int g_devMs, g_devWindowed;
+static void dev_params_log(const char *what, DWORD *pp, HRESULT hr)
+{
+	if (!pp)
+		return;
+	enh_log("device: %s %lux%lu %s, refresh %lu, samples %lu, swap %lu, back buffers %lu, flags 0x%lx, interval 0x%lx: result 0x%lx", what, pp[0], pp[1],
+		pp[7] ? "windowed" : "full screen", pp[11], pp[4], pp[5], pp[3], pp[10], pp[12], (unsigned long)hr);
+}
+
+/* ---- Full screen as a borderless window ----------------------------------------------------------------------------
+ * Alt+Tab out of the engine's exclusive full screen lost the device for good on the system's Direct3D 8 (tests at1-at3, 2026-11-21: TestCooperativeLevel
+ * stayed D3DERR_DEVICELOST with the game's window in front again, or the device was made again and nothing was presented after it): a black screen until
+ * the game was restarted (owner and a guest, 2026-11-21). So a full-screen device is asked for as a window: the game's window loses its frame and covers its
+ * monitor, the picture of the engine's resolution is stretched to it by Present, and no device is ever lost. The engine still believes it runs in full
+ * screen. Its window procedure is told the size it asked for (WM_SIZE), so its viewport keeps the resolution of the settings. Borderless=False in Game.ini
+ * keeps the exclusive full screen. */
+static int g_bdlActive;                 /* the device is a borderless window standing in for full screen */
+static HWND g_bdlWnd;
+static WNDPROC g_bdlOrigProc;
+static int g_bdlUnicode;
+static DWORD g_bdlW, g_bdlH;            /* the size the engine asked for */
+static RECT g_bdlMon;                   /* the monitor the window covers */
+
+static LRESULT CALLBACK bdl_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+	if (g_bdlActive && h == g_bdlWnd) {
+		if (m == WM_SIZE && w != SIZE_MINIMIZED)
+			l = MAKELPARAM(g_bdlW, g_bdlH);
+		else if (m == WM_WINDOWPOSCHANGING && !IsIconic(h)) {
+			WINDOWPOS *wp = (WINDOWPOS *)l;
+			if (wp->x != -32000) {
+				if (!(wp->flags & SWP_NOMOVE)) {
+					wp->x = g_bdlMon.left;
+					wp->y = g_bdlMon.top;
+				}
+				if (!(wp->flags & SWP_NOSIZE)) {
+					wp->cx = g_bdlMon.right - g_bdlMon.left;
+					wp->cy = g_bdlMon.bottom - g_bdlMon.top;
+				}
+			}
+		}
+	}
+	return g_bdlUnicode ? CallWindowProcW(g_bdlOrigProc, h, m, w, l) : CallWindowProcA(g_bdlOrigProc, h, m, w, l);
+}
+
+/* before CreateDevice / Reset: a full-screen request becomes a windowed one */
+static int bdl_params(DWORD *pp, HWND focus)
+{
+	typedef HRESULT (__stdcall *GetAdModeFn)(void *, UINT, DWORD *);
+	DWORD mode[4];
+	HWND wnd;
+	HMONITOR mon;
+	MONITORINFO mi;
+	if (g_noBorderless || !pp || pp[7] != 0 || !g_d3d)
+		return 0;
+	wnd = pp[6] ? (HWND)pp[6] : focus;
+	if (!wnd || ((GetAdModeFn)(*(void ***)g_d3d)[8])(g_d3d, g_adapter, mode) != 0)
+		return 0;
+	mon = MonitorFromWindow(wnd, MONITOR_DEFAULTTOPRIMARY);
+	mi.cbSize = sizeof mi;
+	if (!mon || !GetMonitorInfoA(mon, &mi))
+		return 0;
+	g_bdlMon = mi.rcMonitor;
+	g_bdlW = pp[0];
+	g_bdlH = pp[1];
+	g_bdlWnd = wnd;
+	pp[7] = 1;                          /* windowed */
+	pp[2] = mode[3];                    /* the desktop's format */
+	pp[11] = 0;                         /* no refresh rate in a window */
+	pp[12] = 0;                         /* D3DPRESENT_INTERVAL_DEFAULT: the only one a window takes */
+	if (pp[5] != 1 && pp[5] != 3)
+		pp[5] = 1;                      /* D3DSWAPEFFECT_DISCARD (COPY stays) */
+	return 1;
+}
+
+/* after a windowed device stood in for full screen: the window loses its frame and covers its monitor */
+static void bdl_place(void)
+{
+	LONG st, ex;
+	HWND h = g_bdlWnd;
+	if (!h)
+		return;
+	g_bdlUnicode = IsWindowUnicode(h) ? 1 : 0;
+	if (!g_bdlOrigProc) {
+		g_bdlOrigProc = (WNDPROC)(g_bdlUnicode ? SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)bdl_wndproc) : SetWindowLongPtrA(h, GWLP_WNDPROC, (LONG_PTR)bdl_wndproc));
+		if (!g_bdlOrigProc) {
+			enh_log("borderless: the window procedure could not be replaced (%lu)", (unsigned long)GetLastError());
+			g_bdlActive = 0;
+			return;
+		}
+	}
+	g_bdlActive = 1;
+	st = GetWindowLongA(h, GWL_STYLE);
+	ex = GetWindowLongA(h, GWL_EXSTYLE);
+	SetWindowLongA(h, GWL_STYLE, (st & ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_BORDER | WS_DLGFRAME)) | WS_POPUP);
+	SetWindowLongA(h, GWL_EXSTYLE, ex & ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE));
+	SetWindowPos(h, HWND_TOP, g_bdlMon.left, g_bdlMon.top, g_bdlMon.right - g_bdlMon.left, g_bdlMon.bottom - g_bdlMon.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+	enh_log("borderless: %lux%lu of the engine shown on the monitor %ld,%ld %ldx%ld", (unsigned long)g_bdlW, (unsigned long)g_bdlH, g_bdlMon.left, g_bdlMon.top,
+		g_bdlMon.right - g_bdlMon.left, g_bdlMon.bottom - g_bdlMon.top);
+}
+
+static void hook_surface_lock(void *dev);
+
 static HRESULT __stdcall my_Reset(void *dev, DWORD *pp)
 {
+	HRESULT hr;
+	int bdl = bdl_params(pp, g_devWnd);
+	if (!bdl && pp && pp[7])
+		g_bdlActive = 0;
 	msaa_fix_params(pp);
-	return real_Reset(dev, pp);
+	hr = real_Reset(dev, pp);
+	if (hr != 0 && pp && pp[4] != 0) {
+		enh_log("anti-aliasing: Reset failed (0x%lx) with %lu samples, retrying without", (unsigned long)hr, pp[4]);
+		pp[4] = 0;
+		hr = real_Reset(dev, pp);
+	}
+	dev_params_log("Reset", pp, hr);
+	if (hr == 0 && pp) {
+		g_dev = dev;
+		g_devMs = (int)pp[4];
+		g_devWindowed = (int)pp[7];
+		if (pp[6])
+			g_devWnd = (HWND)pp[6];
+		if (bdl)
+			bdl_place();
+		if (g_devMs >= 2)
+			hook_surface_lock(dev);
+	}
+	return hr;
+}
+
+typedef HRESULT (__stdcall *TestCoopFn)(void *);
+static TestCoopFn real_TestCoop;
+static HRESULT __stdcall my_TestCoop(void *dev)
+{
+	static HRESULT last;
+	static DWORD calls;
+	HRESULT hr = real_TestCoop(dev);
+	calls++;
+	if (hr != last) {
+		enh_log("device: TestCooperativeLevel 0x%lx (was 0x%lx, %lu calls since)", (unsigned long)hr, (unsigned long)last, (unsigned long)calls);
+		last = hr;
+		calls = 0;
+	}
+	return hr;
+}
+
+
+/* The engine reads the finished frame (the picture of the loading screen, the page of the menu book, the shot command) by locking the back buffer, and a
+ * multisampled back buffer cannot be locked on the system's Direct3D 8 ("LockRect failed: D3DERR_INVALIDCALL", the game ends; tests at5-at7: the read is
+ * inlined in UD3DRenderDevice::Present, so ReadPixels itself cannot be hooked). With multisampling the LockRect of a multisampled surface that Direct3D
+ * refuses is answered from the front buffer: the frame shown last, already resolved by Present. In a window the front buffer is the whole desktop of the
+ * adapter: the window's client area is cut out of it and sampled back to the back buffer's size. */
+/* The front buffer is what the adapter's screen shows, other windows included. It is read only when that can be nothing but the game: the game's window
+ * in front, not minimized, full screen or the borderless full screen, on the adapter's monitor. Otherwise the picture stays black. (A test window on the
+ * second monitor read the person's main screen into a game shot, 2026-11-21: never again.) */
+static int front_allowed(void)
+{
+	typedef HMONITOR (__stdcall *GetAdMonFn)(void *, UINT);
+	HMONITOR am;
+	HWND fg = GetForegroundWindow();
+	if (!g_devWnd || IsIconic(g_devWnd) || !fg || GetAncestor(fg, GA_ROOT) != GetAncestor(g_devWnd, GA_ROOT))
+		return 0;
+	if (g_devWindowed && !g_bdlActive)
+		return 0;
+	if (g_d3d) {
+		am = ((GetAdMonFn)(*(void ***)g_d3d)[14])(g_d3d, g_adapter);
+		if (!am || am != MonitorFromWindow(g_devWnd, MONITOR_DEFAULTTONULL))
+			return 0;
+	}
+	return 1;
+}
+
+static int read_front(void *dev, unsigned char *out, DWORD w, DWORD h)
+{
+	void **dvt = *(void ***)dev;
+	typedef HRESULT (__stdcall *GetModeFn)(void *, DWORD *);
+	typedef HRESULT (__stdcall *CreateImgFn)(void *, UINT, UINT, DWORD, void **);
+	typedef HRESULT (__stdcall *GetFrontFn)(void *, void *);
+	typedef HRESULT (__stdcall *LockFn)(void *, DWORD *, const RECT *, DWORD);
+	typedef HRESULT (__stdcall *UnlockFn)(void *);
+	typedef ULONG (__stdcall *RelFn)(void *);
+	DWORD mode[4], lr[2], x, y, cw = w, ch = h;
+	void *img = NULL;
+	POINT o = {0, 0};
+	int ok = 0;
+	HRESULT hr;
+	if (!front_allowed()) {
+		static int said;
+		if (said < 3) {
+			said++;
+			enh_log("front buffer: not read (the game's window is not alone in front on its screen): the picture stays black");
+		}
+		return 0;
+	}
+	if ((hr = ((GetModeFn)dvt[8])(dev, mode)) != 0) {
+		enh_log("ReadPixels: GetDisplayMode failed (0x%lx)", (unsigned long)hr);
+		return 0;
+	}
+	if (g_devWindowed && g_devWnd) {
+		HMONITOR mon = MonitorFromWindow(g_devWnd, MONITOR_DEFAULTTONEAREST);
+		MONITORINFO mi;
+		RECT cr;
+		if (GetClientRect(g_devWnd, &cr) && cr.right > 0 && cr.bottom > 0) {
+			cw = (DWORD)cr.right;
+			ch = (DWORD)cr.bottom;
+		}
+		ClientToScreen(g_devWnd, &o);
+		mi.cbSize = sizeof mi;
+		if (mon && GetMonitorInfoA(mon, &mi)) {
+			o.x -= mi.rcMonitor.left;
+			o.y -= mi.rcMonitor.top;
+		}
+	}
+	if ((hr = ((CreateImgFn)dvt[27])(dev, mode[0], mode[1], 21, &img)) != 0 || !img) {   /* D3DFMT_A8R8G8B8, as GetFrontBuffer wants */
+		enh_log("ReadPixels: CreateImageSurface %lux%lu failed (0x%lx)", (unsigned long)mode[0], (unsigned long)mode[1], (unsigned long)hr);
+		return 0;
+	}
+	hr = ((GetFrontFn)dvt[30])(dev, img);
+	if (hr == 0 && ((LockFn)(*(void ***)img)[9])(img, lr, NULL, 0x10) == 0) {
+		for (y = 0; y < h; y++) {
+			unsigned char *d = out + (size_t)y * w * 4;
+			long sy = o.y + (long)((unsigned long long)y * ch / h);
+			for (x = 0; x < w; x++) {
+				long sx = o.x + (long)((unsigned long long)x * cw / w);
+				if (sx >= 0 && sy >= 0 && (DWORD)sx < mode[0] && (DWORD)sy < mode[1]) {
+					memcpy(d + x * 4, (unsigned char *)lr[1] + (size_t)sy * lr[0] + (size_t)sx * 4, 4);
+					d[x * 4 + 3] = 255;
+				} else {
+					d[x * 4] = d[x * 4 + 1] = d[x * 4 + 2] = 0;
+					d[x * 4 + 3] = 255;
+				}
+			}
+		}
+		((UnlockFn)(*(void ***)img)[10])(img);
+		ok = 1;
+	} else {
+		enh_log("ReadPixels: GetFrontBuffer failed (0x%lx)", (unsigned long)hr);
+	}
+	((RelFn)(*(void ***)img)[2])(img);
+	return ok;
+}
+
+typedef HRESULT (__stdcall *SurfLockFn)(void *, DWORD *, const RECT *, DWORD);
+typedef HRESULT (__stdcall *SurfUnlockFn)(void *);
+static SurfLockFn real_SurfLock;
+static SurfUnlockFn real_SurfUnlock;
+static void *g_fakeLocked;              /* the surface whose lock is served from g_fakeBits */
+static LONG g_fakeLocks;                /* how many locks were answered from the front buffer (in the [FPS] line) */
+static unsigned char *g_fakeBits;
+static size_t g_fakeSize;
+
+static HRESULT __stdcall my_SurfLock(void *surf, DWORD *lr, const RECT *rc, DWORD flags)
+{
+	typedef HRESULT (__stdcall *GetDescFn)(void *, DWORD *);
+	static int logged;
+	DWORD desc[8];
+	HRESULT hr = real_SurfLock(surf, lr, rc, flags);
+	if (hr == 0 || g_devMs < 2 || !g_dev || !lr || g_fakeLocked || ((GetDescFn)(*(void ***)surf)[8])(surf, desc) != 0 || desc[5] == 0)
+		return hr;
+	if (g_fakeSize < (size_t)desc[6] * desc[7] * 4) {
+		free(g_fakeBits);
+		g_fakeSize = (size_t)desc[6] * desc[7] * 4;
+		g_fakeBits = (unsigned char *)malloc(g_fakeSize);
+		if (!g_fakeBits) {
+			g_fakeSize = 0;
+			return hr;
+		}
+	}
+	if (!read_front(g_dev, g_fakeBits, desc[6], desc[7]))
+		memset(g_fakeBits, 0, (size_t)desc[6] * desc[7] * 4);
+	lr[0] = desc[6] * 4;
+	lr[1] = (DWORD)(g_fakeBits + (rc ? (size_t)rc->top * desc[6] * 4 + (size_t)rc->left * 4 : 0));
+	g_fakeLocked = surf;
+	g_fakeLocks++;
+	if (logged < 3) {
+		logged++;
+		enh_log("back buffer: a lock of the %lux%lu multisampled surface (format %lu) answered from the front buffer", (unsigned long)desc[6], (unsigned long)desc[7],
+			(unsigned long)desc[0]);
+	}
+	return 0;
+}
+
+static HRESULT __stdcall my_SurfUnlock(void *surf)
+{
+	if (surf && surf == g_fakeLocked) {
+		g_fakeLocked = NULL;
+		return 0;
+	}
+	return real_SurfUnlock(surf);
+}
+
+/* the surface methods of the back buffer (slots 9 LockRect, 10 UnlockRect) are replaced once; the vtable is the class's, shared by the surfaces of its
+ * kind, so a surface that is not multisampled keeps the real lock */
+static void hook_surface_lock(void *dev)
+{
+	void **dvt = *(void ***)dev;
+	typedef HRESULT (__stdcall *GetBBFn)(void *, UINT, DWORD, void **);
+	typedef ULONG (__stdcall *RelFn)(void *);
+	void *bb = NULL, **svt;
+	DWORD old;
+	if (real_SurfLock || ((GetBBFn)dvt[16])(dev, 0, 0, &bb) != 0 || !bb)
+		return;
+	svt = *(void ***)bb;
+	if (VirtualProtect(&svt[9], 2 * sizeof(void *), PAGE_READWRITE, &old)) {
+		real_SurfLock = (SurfLockFn)svt[9];
+		real_SurfUnlock = (SurfUnlockFn)svt[10];
+		svt[9] = (void *)my_SurfLock;
+		svt[10] = (void *)my_SurfUnlock;
+		VirtualProtect(&svt[9], 2 * sizeof(void *), old, &old);
+		enh_log("back buffer: LockRect hooked (a refused lock of a multisampled surface is answered from the front buffer)");
+	}
+	((RelFn)(*(void ***)bb)[2])(bb);
+}
+
+/* ReduceMouseLag=True (Game.ini, on by default): every frame D3DDrv's Present calls ReadPixels(NULL, NULL), which only locks and unlocks the back buffer
+ * so the processor waits for the graphics adapter (Present at 0x100133f0: this+0x410c set, not the editor, this+0x4114 clear). A multisampled back
+ * buffer cannot be locked: that ended the game at the first frame (test at5), and answered from the front buffer it cost a full read of the screen per
+ * frame (26 fps, test at9). With multisampling that empty call is skipped; a real read (a buffer to fill) still goes to the engine and its lock is answered
+ * by my_SurfLock. */
+typedef void (__attribute__((thiscall)) *ReadPixelsFn)(void *, void *, void *);
+static ReadPixelsFn orig_ReadPixels;
+static void __attribute__((thiscall)) hook_ReadPixels(void *self, void *viewport, void *colors)
+{
+	if (!colors && g_devMs >= 2)
+		return;
+	orig_ReadPixels(self, viewport, colors);
+}
+
+/* the size of the back buffer (the viewport's picture) */
+static int back_size(void *dev, DWORD *w, DWORD *h)
+{
+	void **dvt = *(void ***)dev;
+	typedef HRESULT (__stdcall *GetBBFn)(void *, UINT, DWORD, void **);
+	typedef HRESULT (__stdcall *GetDescFn)(void *, DWORD *);
+	typedef ULONG (__stdcall *RelFn)(void *);
+	void *bb = NULL;
+	DWORD desc[8];
+	int ok = 0;
+	if (((GetBBFn)dvt[16])(dev, 0, 0, &bb) != 0 || !bb)
+		return 0;
+	if (((GetDescFn)(*(void ***)bb)[8])(bb, desc) == 0) {
+		*w = desc[6];
+		*h = desc[7];
+		ok = 1;
+	}
+	((RelFn)(*(void ***)bb)[2])(bb);
+	return ok;
+}
+
+
+/* Who draws (diagnostics after a device change): for 20 s after every SetRes, once a second, how often the window's Repaint and Lock and the render
+ * device's Lock and Present were called and how often a Lock gave nothing. */
+static DWORD g_drawLogUntil, g_drawLogAt;
+static LONG g_cRepaint, g_cVpLock, g_cVpLockOk, g_cRdLock, g_cRdLockOk, g_cRdPresent;
+static void draw_log_tick(void)
+{
+	DWORD now = GetTickCount();
+	if (!g_drawLogUntil || (LONG)(now - g_drawLogUntil) > 0 || (LONG)(now - g_drawLogAt) < 1000)
+		return;
+	g_drawLogAt = now;
+	enh_log("draw: window Repaint %ld, window Lock %ld (ok %ld), device Lock %ld (ok %ld), device Present %ld", g_cRepaint, g_cVpLock, g_cVpLockOk, g_cRdLock,
+		g_cRdLockOk, g_cRdPresent);
+	g_cRepaint = g_cVpLock = g_cVpLockOk = g_cRdLock = g_cRdLockOk = g_cRdPresent = 0;
+}
+typedef void (__attribute__((thiscall)) *VpRepaintFn)(void *, int);
+typedef int (__attribute__((thiscall)) *VpLockFn)(void *, void *, void *);
+typedef void *(__attribute__((thiscall)) *RdLockFn)(void *, void *, void *, void *);
+typedef void (__attribute__((thiscall)) *RdPresentFn)(void *, void *);
+static VpRepaintFn orig_VpRepaint;
+static VpLockFn orig_VpLock;
+static RdLockFn orig_RdLock;
+static RdPresentFn orig_RdPresent;
+static void __attribute__((thiscall)) hook_VpRepaint(void *self, int blit)
+{
+	g_cRepaint++;
+	draw_log_tick();
+	orig_VpRepaint(self, blit);
+}
+static int __attribute__((thiscall)) hook_VpLock(void *self, void *hit, void *size)
+{
+	int r = orig_VpLock(self, hit, size);
+	g_cVpLock++;
+	if (r)
+		g_cVpLockOk++;
+	return r;
+}
+static void *__attribute__((thiscall)) hook_RdLock(void *self, void *vp, void *hit, void *size)
+{
+	void *r = orig_RdLock(self, vp, hit, size);
+	g_cRdLock++;
+	if (r)
+		g_cRdLockOk++;
+	return r;
+}
+static void __attribute__((thiscall)) hook_RdPresent(void *self, void *vp)
+{
+	g_cRdPresent++;
+	orig_RdPresent(self, vp);
+}
+
+/* UD3DRenderDevice::SetRes(viewport, x, y, full screen, color bytes, save size): logged, with its result (the engine calls it again when the window comes
+ * back from Alt+Tab). */
+typedef int (__attribute__((thiscall)) *SetResFn)(void *, void *, int, int, int, int, int);
+static SetResFn orig_SetRes;
+static int __attribute__((thiscall)) hook_SetRes(void *self, void *viewport, int x, int y, int full, int cb, int save)
+{
+	int r;
+	enh_log("device: SetRes %dx%d, full screen %d, %d bytes, save %d", x, y, full, cb, save);
+	r = orig_SetRes(self, viewport, x, y, full, cb, save);
+	enh_log("device: SetRes %dx%d returned %d", x, y, r);
+	g_drawLogUntil = GetTickCount() + 20000;
+	return r;
 }
 
 /* ---- Frame limiter: IDirect3DDevice8::Present (slot 15 of the device) is followed by a wait until the next frame is due. Sleep (1 ms timer) for
@@ -826,6 +1286,30 @@ static void grab_frame(void *dev)
 	static int n;
 	char name[64];
 	FILE *f;
+	if (g_devMs >= 2) {
+		DWORD w, h, y;
+		unsigned char *px;
+		if (!back_size(dev, &w, &h) || !(px = (unsigned char *)malloc((size_t)w * h * 4)))
+			return;
+		if (read_front(dev, px, w, h)) {
+			snprintf(name, sizeof name, "grab_%d.bmp", ++n);
+			f = fopen(name, "wb");
+			if (f) {
+				unsigned char hd[54] = {0x42, 0x4d};
+				DWORD sz = 54 + w * h * 4, off = 54, bi = 40, pl = 1, bpp = 32;
+				memcpy(hd + 2, &sz, 4); memcpy(hd + 10, &off, 4); memcpy(hd + 14, &bi, 4);
+				memcpy(hd + 18, &w, 4); { int nh = -(int)h; memcpy(hd + 22, &nh, 4); }
+				memcpy(hd + 26, &pl, 2); memcpy(hd + 28, &bpp, 2);
+				fwrite(hd, 1, 54, f);
+				for (y = 0; y < h; y++)
+					fwrite(px + (size_t)y * w * 4, 1, w * 4, f);
+				fclose(f);
+				enh_log("grab: %s %lux%lu from the front buffer", name, (unsigned long)w, (unsigned long)h);
+			}
+		}
+		free(px);
+		return;
+	}
 	if (((GetBBFn)dvt[16])(dev, 0, 0, &bb) != 0 || !bb)
 		return;
 	if (((GetDescFn)(*(void ***)bb)[8])(bb, desc) == 0 && ((CreateImgFn)dvt[27])(dev, desc[6], desc[7], desc[0], &img) == 0 && img) {
@@ -943,6 +1427,16 @@ static HRESULT __stdcall my_Present(void *dev, const void *src, const void *dst,
 	HRESULT hr = real_Present(dev, src, dst, wnd, dirty);
 	QueryPerformanceCounter(&pb);
 	{
+		static HRESULT lastHr;
+		static DWORD same;
+		same++;
+		if (hr != lastHr) {
+			enh_log("device: Present 0x%lx (was 0x%lx for %lu frames)", (unsigned long)hr, (unsigned long)lastHr, (unsigned long)same);
+			lastHr = hr;
+			same = 0;
+		}
+	}
+	{
 		/* [FPS] once per 5 s: frames, average rate, the longest frame, and how much of the time the process waited inside Present (the graphics
 		 * adapter or the screen); the pid tells the host's line from the guest's when both write one log */
 		static DWORD calls, t0;
@@ -961,8 +1455,12 @@ static HRESULT __stdcall my_Present(void *dev, const void *src, const void *dst,
 			t0 = tn;
 		calls++;
 		if (tn - t0 >= 5000) {
-			enh_log("[FPS] pid %lu: %lu frames in %lu ms = %.1f fps, longest frame %.0f ms, %.0f %% of the time inside Present (limit %d)", GetCurrentProcessId(), (unsigned long)calls,
-				(unsigned long)(tn - t0), calls * 1000.0 / (tn - t0), worst * 1000.0 / qf, inPresent * 100.0 * 1000.0 / qf / (tn - t0), g_maxfps);
+			enh_log("[FPS] pid %lu: %lu frames in %lu ms = %.1f fps, longest frame %.0f ms, %.0f %% of the time inside Present (limit %d)%s", GetCurrentProcessId(), (unsigned long)calls,
+				(unsigned long)(tn - t0), calls * 1000.0 / (tn - t0), worst * 1000.0 / qf, inPresent * 100.0 * 1000.0 / qf / (tn - t0), g_maxfps, g_devMs >= 2 ? ", MSAA" : "");
+			if (g_fakeLocks) {
+				enh_log("[FPS] pid %lu: %ld reads of the multisampled back buffer answered from the front buffer", GetCurrentProcessId(), g_fakeLocks);
+				g_fakeLocks = 0;
+			}
 			calls = 0;
 			worst = 0;
 			inPresent = 0;
@@ -997,8 +1495,12 @@ static HRESULT __stdcall my_Present(void *dev, const void *src, const void *dst,
 static HRESULT __stdcall my_CreateDevice(void *d3d, UINT adapter, UINT type, HWND wnd, DWORD flags, DWORD *pp, void **out)
 {
 	HRESULT hr;
+	int bdl;
 	g_adapter = adapter;
 	g_devtype = type;
+	bdl = bdl_params(pp, wnd);
+	if (!bdl && pp && pp[7])
+		g_bdlActive = 0;
 	msaa_fix_params(pp);
 	hr = real_CreateDevice(d3d, adapter, type, wnd, flags, pp, out);
 	if (hr != 0 && g_msaa >= 2 && pp && pp[4] != 0) {
@@ -1007,9 +1509,25 @@ static HRESULT __stdcall my_CreateDevice(void *d3d, UINT adapter, UINT type, HWN
 		pp[4] = 0;
 		hr = real_CreateDevice(d3d, adapter, type, wnd, flags, pp, out);
 	}
+	dev_params_log("CreateDevice", pp, hr);
+	if (hr == 0 && out && *out && pp) {
+		g_dev = *out;
+		g_devMs = (int)pp[4];
+		g_devWindowed = (int)pp[7];
+		g_devWnd = pp[6] ? (HWND)pp[6] : wnd;
+		if (bdl)
+			bdl_place();
+		if (g_devMs >= 2)
+			hook_surface_lock(*out);
+	}
 	if (hr == 0 && out && *out && !real_Reset) {
 		void **dvt = *(void ***)*out;
 		DWORD old;
+		real_TestCoop = (TestCoopFn)dvt[3];
+		if (VirtualProtect(&dvt[3], sizeof(void *), PAGE_READWRITE, &old)) {
+			dvt[3] = (void *)my_TestCoop;
+			VirtualProtect(&dvt[3], sizeof(void *), old, &old);
+		}
 		real_Reset = (ResetFn)dvt[14];
 		if (VirtualProtect(&dvt[14], sizeof(void *), PAGE_READWRITE, &old)) {
 			dvt[14] = (void *)my_Reset;
@@ -1038,17 +1556,28 @@ void *__stdcall Direct3DCreate8(UINT version)
 	if (!real)
 		return NULL;
 	d3d = real(version);
-	if (d3d && !g_d3d) {
+	if (d3d && !real_CreateDevice) {
 		void **vt = *(void ***)d3d;
 		DWORD old;
-		g_d3d = d3d;
 		real_CreateDevice = (CreateDeviceFn)vt[15];
 		if (VirtualProtect(&vt[15], sizeof(void *), PAGE_READWRITE, &old)) {
 			vt[15] = (void *)my_CreateDevice;
 			VirtualProtect(&vt[15], sizeof(void *), old, &old);
 		}
-		enh_log("Direct3DCreate8: IDirect3D8 %p, CreateDevice hooked, multisampling %dx", d3d, g_msaa);
+		if (!real_is_dxvk() && hook_thunk("D3DDrv.dll", "?ReadPixels@UD3DRenderDevice@@UAEXPAVUViewport@@PAVFColor@@@Z", (void *)hook_ReadPixels, (void **)&orig_ReadPixels))
+			g_readPixelsHooked = 1;
+		hook_thunk("D3DDrv.dll", "?SetRes@UD3DRenderDevice@@UAEHPAVUViewport@@HHHHH@Z", (void *)hook_SetRes, (void **)&orig_SetRes);
+		hook_thunk("D3DDrv.dll", "?Lock@UD3DRenderDevice@@UAEPAVFRenderInterface@@PAVUViewport@@PAEPAH@Z", (void *)hook_RdLock, (void **)&orig_RdLock);
+		hook_thunk("D3DDrv.dll", "?Present@UD3DRenderDevice@@UAEXPAVUViewport@@@Z", (void *)hook_RdPresent, (void **)&orig_RdPresent);
+		hook_thunk("WinDrv.dll", "?Repaint@UWindowsViewport@@UAEXH@Z", (void *)hook_VpRepaint, (void **)&orig_VpRepaint);
+		hook_thunk("WinDrv.dll", "?Lock@UWindowsViewport@@UAEHPAEPAH@Z", (void *)hook_VpLock, (void **)&orig_VpLock);
+		enh_log("Direct3DCreate8: IDirect3D8 %p, CreateDevice hooked, multisampling %dx%s", d3d, g_msaa,
+			g_readPixelsHooked ? " (system Direct3D 8: a lock of the multisampled back buffer is answered from the front buffer)" : "");
+	} else if (d3d) {
+		enh_log("Direct3DCreate8: IDirect3D8 %p made again", d3d);
 	}
+	if (d3d)
+		g_d3d = d3d;
 	return d3d;
 }
 
@@ -2288,7 +2817,6 @@ static void native_init(void)
 			pSkelClass = (void *)GetProcAddress(eng, "?PrivateStaticClass@USkeletalMeshInstance@@0VUClass@@A");
 		}
 		fn_GetName = (GetNameFn)GetProcAddress(GetModuleHandleA("Core.dll"), "?GetName@UObject@@QBEPBGXZ");
-		hook_thunk("Engine.dll", "?ReplicateAnim@AActor@@QAEXHVFName@@MMMMH@Z", (void *)hook_ReplicateAnim, (void **)&orig_ReplicateAnim);
 		hook_thunk("Engine.dll", "?eventPlayerCalcView@APlayerController@@QAEXAAPAVAActor@@AAVFVector@@AAVFRotator@@@Z", (void *)hook_PlayerCalcView, (void **)&orig_PlayerCalcView);
 		hook_thunk("Engine.dll", "?PlayReplicatedAnim@AActor@@QAEXXZ", (void *)hook_PlayReplicatedAnim, (void **)&orig_PlayReplicatedAnim);
 		hook_thunk("Engine.dll", "?CheckHearSound@APlayerController@@UAEXPAVAActor@@HPAVUSound@@VFVector@@MHH@Z", (void *)hook_CheckHearSound, (void **)&orig_CheckHearSound);
@@ -2302,6 +2830,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 	(void)inst; (void)reserved;
 	if (reason == DLL_PROCESS_ATTACH) {
 		HMODULE k32 = GetModuleHandleA("kernel32.dll");
+		InitializeCriticalSection(&g_logLock);
+		g_logLockReady = 1;
+		g_inDllMain = 1;
 		real_GetProcAddress = (void *)GetProcAddress(k32, "GetProcAddress");
 		real_CreateMutexA = (void *)GetProcAddress(k32, "CreateMutexA");
 		real_CreateMutexW = (void *)GetProcAddress(k32, "CreateMutexW");
@@ -2309,6 +2840,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 		patch_module(GetModuleHandleA("Core.dll"));
 		patch_module(GetModuleHandleA("Engine.dll"));
 		native_init();
+		g_inDllMain = 0;
 	}
 	return TRUE;
 }

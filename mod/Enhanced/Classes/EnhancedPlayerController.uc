@@ -5,6 +5,10 @@ var string TravelHost;    // the host's address while the level is being changed
 var int TravelTries;
 var string LastView;
 var float BotJumpHold;
+var float ClimbPhysSince;   // client: since when his hero has the climbing physics without climbing (see ClientClimbWatch)
+var float ClimbStuckSince;  // server: when the server's copy of this guest's hero went into a climb; client: when his own hero did (0 = not climbing)
+var float ClimbTestT;      // tests (EnhClimbTest): seconds since the host put this guest in front of the swamp's stump; the bot walks into it and jumps
+var float ClimbLogClock;
 var config bool bTestBot;   // tests only: the client plays a fixed script of inputs (set in the test profile's User.ini)
 var config bool bTestSkipCut;   // tests only: the scripted guest skips his own cutscenes after 8 s
 var float BotTime;
@@ -369,7 +373,7 @@ event PreClientTravel()
 replication
 {
 	reliable if (Role == ROLE_Authority)
-		ClientCutCast, ClientLocalCut, ClientCutHostEnded, ClientMusic, ClientIntroFirst;
+		ClientCutCast, ClientLocalCut, ClientCutHostEnded, ClientMusic, ClientIntroFirst, ClientClimbTest, ClientEndClimb;
 	reliable if (Role < ROLE_Authority)
 		ServerLocalCutDone;
 	reliable if (Role == ROLE_Authority)
@@ -453,10 +457,149 @@ function DoHorPlus(float DeltaTime)
 }
 
 // Tests only: a scripted player. The inputs go through the same EnhancedInput code a keyboard and a mouse reach.
+// ---- A guest's climb that never ends ----
+// A guest who climbed the stump of the swamp stayed stuck (owner, 2026-11-21): both his game and the host's copy of his Shrek started the climb ("Mount
+// deltaZ:204.72", a big climb from walking), then the server's copy stood still in mid-climb for ten seconds and more, with its collision off (the climb
+// takes it away), and the guest ended inside the stump. A climb takes a second or two: a guest's hero still climbing after four seconds is put on the
+// climb's top, on the server and on his own machine alike.
+static function bool InClimb(Pawn P)
+{
+	return P != None && (P.IsInState('Mounting') || P.IsInState('MountFinish'));
+}
+
+static function EndClimb(Pawn P)
+{
+	local KWPawn K;
+	local Vector D;
+
+	K = KWPawn(P);
+	if (K == None)
+	{
+		return;
+	}
+	D = K.MountDestination;
+	K.SetCollisionSize(K.default.CollisionRadius, K.default.CollisionHeight);
+	K.SetCollision(true, true, true);
+	K.bCollideWorld = true;
+	K.bMountFinished = true;
+	K.bPhysicsAnimUpdate = true;
+	if (D != vect(0, 0, 0) && VSize(D - K.Location) < 400.0)
+	{
+		if (!K.SetLocation(D + vect(0, 0, 10)))
+		{
+			K.SetLocation(D + vect(0, 0, 50));
+		}
+	}
+	K.Velocity = vect(0, 0, 0);
+	K.SetPhysics(PHYS_Falling);
+	K.GotoState('StateIdle');
+}
+
+// the server ended this guest's climb: the same on his machine, at the server's place
+simulated function ClientEndClimb(Vector L)
+{
+	if (Pawn == None)
+	{
+		return;
+	}
+	Log("[SDBG] climb: the server ended my climb at " $ string(L) $ " (my hero was at " $ string(Pawn.Location) $ ", state " $ string(Pawn.GetStateName()) $ ")");
+	EndClimb(Pawn);
+	Pawn.SetLocation(L);
+	ClimbStuckSince = 0.0;
+}
+
+// the guest's own watch (his machine). Seen in test lc13 (the stump of the swamp, the same climb as the owner's guest: "Mount deltaZ:204.69"): the
+// guest's own game never started the climb, the server's copy did, and the server's corrections during it gave his hero the climb's physics
+// (PHYS_Projectile, 6) and its places; the server's climb ended, his hero stayed in StateIdle with that physics and could never move again. A hero
+// with physics 6 outside a climb is given the falling physics back (it lands where it stands). A climb that lasts too long is ended as on the server.
+function ClientClimbWatch()
+{
+	if (Level.NetMode != NM_Client || Pawn == None)
+	{
+		ClimbStuckSince = 0.0;
+		return;
+	}
+	if (Pawn.Physics == PHYS_Projectile && !InClimb(Pawn) && !Pawn.IsInState('MountHanging'))
+	{
+		if (ClimbPhysSince == 0.0)
+		{
+			ClimbPhysSince = Level.TimeSeconds;
+		}
+		else if (Level.TimeSeconds - ClimbPhysSince > 0.4)
+		{
+			Log("[SDBG] climb: my hero kept the climbing physics after the climb at " $ string(Pawn.Location) $ " (state " $ string(Pawn.GetStateName()) $ "): it falls again");
+			Pawn.Velocity = vect(0, 0, 0);
+			Pawn.SetPhysics(PHYS_Falling);
+			ClimbPhysSince = 0.0;
+		}
+	}
+	else
+	{
+		ClimbPhysSince = 0.0;
+	}
+	if (!InClimb(Pawn))
+	{
+		ClimbStuckSince = 0.0;
+		return;
+	}
+	if (ClimbStuckSince == 0.0)
+	{
+		ClimbStuckSince = Level.TimeSeconds;
+		return;
+	}
+	if (Level.TimeSeconds - ClimbStuckSince > 5.0)
+	{
+		Log("[SDBG] climb: my hero is still in " $ string(Pawn.GetStateName()) $ " after 5 s at " $ string(Pawn.Location) $ ": ended here");
+		EndClimb(Pawn);
+		ClimbStuckSince = 0.0;
+	}
+}
+
+// Tests (EnhClimbTest): the host has put this guest in front of the stump of the swamp; the scripted input walks into it and jumps twice, and the guest's
+// place and state are logged four times a second ([CLIMB]; the server logs its copy the same way).
+simulated function ClientClimbTest()
+{
+	ClimbTestT = 0.001;
+	ClimbLogClock = 0.0;
+	Log("[CLIMB] client: the climb test starts");
+}
+
 function BotInput(float DeltaTime)
 {
 	if (!bTestBot || Pawn == None)
 	{
+		return;
+	}
+	if (ClimbTestT > 0.0)
+	{
+		ClimbTestT += DeltaTime;
+		if (ClimbTestT > 0.3 && ClimbTestT < 3.5)
+		{
+			aBaseY = 1200.0;
+		}
+		if ((ClimbTestT > 1.2 && ClimbTestT < 1.2 + DeltaTime * 1.5) || (ClimbTestT > 2.4 && ClimbTestT < 2.4 + DeltaTime * 1.5))
+		{
+			bPressedJump = true;
+			BotJumpHold = 0.12;
+			Log("[CLIMB] client: jump at t=" $ string(ClimbTestT));
+		}
+		if (BotJumpHold > 0.0)
+		{
+			BotJumpHold -= DeltaTime;
+			aUp = 1200.0;
+		}
+		ClimbLogClock += DeltaTime;
+		if (ClimbLogClock >= 0.25)
+		{
+			ClimbLogClock = 0.0;
+			Log("[CLIMB] client t=" $ string(ClimbTestT) $ " at " $ string(Pawn.Location) $ " state " $ string(Pawn.GetStateName()) $ " phys " $ string(int(Pawn.Physics))
+				$ " base " $ string(Pawn.Base));
+		}
+		if (ClimbTestT > 16.0)
+		{
+			ClimbTestT = 0.0;
+			Log("[CLIMB] client: the climb test ends");
+		}
 		return;
 	}
 	if (BotTime == 0.0)
@@ -1489,6 +1632,7 @@ event PlayerTick(float DeltaTime)
 	{
 		EnhNetClient(1);
 		ClientHeroValues();
+		ClientClimbWatch();
 	}
 	UndoHorPlus();
 	Super.PlayerTick(DeltaTime);

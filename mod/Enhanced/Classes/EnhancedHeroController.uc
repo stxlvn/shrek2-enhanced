@@ -133,129 +133,8 @@ event ClientOpenMenu(string Menu, optional bool bDisconnect, optional string Msg
 
 // ---- The stock Settings page, video tab ----
 // The tab is two columns of labels and lists that overlap (a long label runs over its list, the rows are uneven), "colour depth" (32 or 16 bit)
-// means nothing on a machine of today, and the row for the renderer is hidden. The controls are put on one grid (a label above its list, the
-// same pitch everywhere, short labels); "colour depth" becomes the anti-aliasing and the hidden renderer row the anisotropic filtering, both
-// applied at once through a change of the resolution to the current one (the Direct3D hook of the engine layer asks for them when the device
-// is made again).
-function string AAText(int Samples)
-{
-	if (Samples < 2)
-	{
-		return Localize("Menu", "Off", "Enhanced");
-	}
-	return string(Samples) $ "x";
-}
-
-function string AFText(int Level)
-{
-	if (Level < 2)
-	{
-		return Localize("Menu", "Off", "Enhanced");
-	}
-	return string(Level) $ "x";
-}
-
-function int AAIndex(int Samples)
-{
-	if (Samples >= 8)
-	{
-		return 3;
-	}
-	if (Samples >= 4)
-	{
-		return 2;
-	}
-	if (Samples >= 2)
-	{
-		return 1;
-	}
-	return 0;
-}
-
-function int AFIndex(int Level)
-{
-	if (Level >= 16)
-	{
-		return 3;
-	}
-	if (Level >= 8)
-	{
-		return 2;
-	}
-	if (Level >= 4)
-	{
-		return 1;
-	}
-	return 0;
-}
-
-function ApplyVideoNow()
-{
-	ConsoleCommand("SETRES " $ ConsoleCommand("GetCurrentRes"));
-}
-
-function EnhAAChanged(GUIComponent Sender)
-{
-	local string T;
-	local int V;
-
-	if (bFilling)
-	{
-		return;
-	}
-	T = FixedPage.VideoTab.cbColorDepth.GetText();
-	if (T != AAText(0) && T != "2x" && T != "4x" && T != "8x")
-	{
-		return;
-	}
-	V = 0;
-	if (T == "2x")
-	{
-		V = 2;
-	}
-	else if (T == "4x")
-	{
-		V = 4;
-	}
-	else if (T == "8x")
-	{
-		V = 8;
-	}
-	EnhSetSetting(1, V);
-	ApplyVideoNow();
-}
-
-function EnhAFChanged(GUIComponent Sender)
-{
-	local string T;
-	local int V;
-
-	if (bFilling)
-	{
-		return;
-	}
-	T = FixedPage.VideoTab.cbRenderer.GetText();
-	if (T != AFText(1) && T != "4x" && T != "8x" && T != "16x")
-	{
-		return;
-	}
-	V = 1;
-	if (T == "4x")
-	{
-		V = 4;
-	}
-	else if (T == "8x")
-	{
-		V = 8;
-	}
-	else if (T == "16x")
-	{
-		V = 16;
-	}
-	EnhSetSetting(2, V);
-	ApplyVideoNow();
-}
-
+// means nothing on a machine of today, and the row for the renderer is hidden. The controls are put on one grid (EnhancedMenuFit.LayoutOptions);
+// "colour depth" becomes the anti-aliasing and the hidden renderer row the anisotropic filtering (EnhancedMenuFit.VideoLists).
 function Place(GUIComponent C, float L, float T, float W, float H)
 {
 	C.WinLeft = L;
@@ -337,34 +216,7 @@ function FixSettingsPage(GUIController GC)
 		V.lblRenderer.bVisible = true;
 	}
 	Class'Enhanced.EnhancedMenuFit'.static.ShortKeyNames(FixedPage.GameTab);
-	// the stock page fills these two lists with the bit depth and the renderer again whenever it refreshes: filled again until they are ours
-	if (!bAASet)
-	{
-		bFilling = true;
-		V.cbColorDepth.OnChange = EnhAAChanged;
-		Log("[SDBG] settings: AA=" $ string(EnhGetSetting(1)) $ " AF=" $ string(EnhGetSetting(2)) $ " dxvk=" $ string(EnhGetSetting(3)) $ " texts '" $ V.cbColorDepth.GetText() $ "' '" $ V.cbRenderer.GetText() $ "'");
-		V.cbColorDepth.List.Clear();
-		V.cbColorDepth.AddItem(AAText(0));
-		V.cbColorDepth.AddItem("2x");
-		V.cbColorDepth.AddItem("4x");
-		V.cbColorDepth.AddItem("8x");
-		V.cbColorDepth.SetIndex(AAIndex(EnhGetSetting(1)));
-		bAASet = true;
-		bFilling = false;
-	}
-	if (!bAFSet)
-	{
-		bFilling = true;
-		V.cbRenderer.OnChange = EnhAFChanged;
-		V.cbRenderer.List.Clear();
-		V.cbRenderer.AddItem(AFText(1));
-		V.cbRenderer.AddItem("4x");
-		V.cbRenderer.AddItem("8x");
-		V.cbRenderer.AddItem("16x");
-		V.cbRenderer.SetIndex(AFIndex(EnhGetSetting(2)));
-		bAFSet = true;
-		bFilling = false;
-	}
+	// the two repurposed lists of the video tab (anti-aliasing, anisotropy): EnhancedMenuFit.VideoLists, for the guests' page as well
 }
 
 // Tests only: the steps of EnhMenu are pressed on the open page, one every five seconds, after twelve.

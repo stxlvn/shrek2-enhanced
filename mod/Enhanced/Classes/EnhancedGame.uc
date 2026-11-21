@@ -126,6 +126,16 @@ var KWPawn CarrierCache;             // the pawn that holds the shared inventory
 var bool bBonusLeaving;              // the bonus level has been left: the way back is already started
 var float BonusTestAt;               // URL option EnhBonusAt=<seconds> (tests): the exit of a bonus level is activated at that time
 var bool bBonusTested;
+var float ClimbTestAt;                // URL option EnhClimbTest=<seconds> (tests, swamp): a guest is put in front of the stump the owner's guest got stuck in
+var bool bClimbTested;
+var EnhancedPlayerController ClimbWatch;
+var float ClimbWatchUntil, ClimbLogAt;
+var float BagTestAt;                  // URL option EnhBagTest=<seconds> (tests): at that time the host's punching bags get a push (a blow of the host), 6 s later
+                                      // a guest is put next to one and his attack is pressed four times (his blows), 8 s after that the bags still hanging are used
+                                      // up; the bags' state goes to the log twice a second ([BAG]); the guest's copies log their poses ([BAG] client)
+var int BagStep;
+var float BagLogAt;
+var KActor BagHit;
 var float GotoAt;                    // URL option EnhGotoAt=<seconds> (with EnhGoto=<map>): in the front-end level the host's controller opens that map by itself (tests: the path from the main menu into a level)
 var string GotoMap;
 var bool bGotoDone;
@@ -173,6 +183,7 @@ var array<string> IntroWait;             // host: the guests still playing this 
 var float IntroWaitClock;                // host: seconds (frames, also while paused) since the last guest went away for an opening
 var bool bIntroPaused;                   // host: the world is paused by IntroWaitTick
 var float IntroPausedAt;                 // host: IntroWaitClock when that pause began
+var bool bHostOpeningSeen;               // host: his own opening of this level is over (or the level has none): only then may the world wait for a guest
 var bool bIntroShot;                     // tests (EnhShot): one picture of the waiting host is taken
 var string IntroWaitNote;                // host: the note on the host's HUD while the world waits (EnhancedHud draws it)
 var float TweakAt;                       // next time HeroTweaks runs
@@ -273,6 +284,8 @@ event InitGame(string Options, out string Error)
 	HostMenuPage = ParseOption(Options, "EnhHostMenuPage");
 	GotoAt = float(ParseOption(Options, "EnhGotoAt"));
 	BonusTestAt = float(ParseOption(Options, "EnhBonusAt"));
+	BagTestAt = float(ParseOption(Options, "EnhBagTest"));
+	ClimbTestAt = float(ParseOption(Options, "EnhClimbTest"));
 	CkptTestAt = float(ParseOption(Options, "EnhCkptTest"));
 	HudTestAt = float(ParseOption(Options, "EnhHudTest"));
 	GotoMap = ParseOption(Options, "EnhGoto");
@@ -1057,7 +1070,28 @@ function IntroWaitTick(float DeltaTime)
 		IntroWait.Length = 0;
 	}
 	Host = HostController();
-	bWait = IntroWait.Length > 0 && Host != None && Host.Pawn != None && Host.PlayerReplicationInfo != None && ActiveCut == None && !bRestarting && !IsMenuLevel() && !IsCutsceneLevel();
+	// The host's own opening comes first: at the level's start no cutscene runs yet, and the world was paused before the host's opening had begun (owner's
+	// log of 2026-11-21: paused at t=0.5, the host's opening played only after the guest was back). Over = a cutscene of the host has started and ended,
+	// or the level has no opening, or none began within eight seconds.
+	if (!bHostOpeningSeen && IntroWait.Length > 0)
+	{
+		if (CutSerial > 0 && ActiveCut == None)
+		{
+			bHostOpeningSeen = true;
+			T("intro wait: the host's opening is over");
+		}
+		else if (!HasOpening(MapName()) || ShouldSkipIntro())
+		{
+			bHostOpeningSeen = true;
+			T("intro wait: the level has no opening for the host");
+		}
+		else if (CutSerial == 0 && Level.TimeSeconds > 8.0)
+		{
+			bHostOpeningSeen = true;
+			T("intro wait: no opening began on the host within 8 s");
+		}
+	}
+	bWait = IntroWait.Length > 0 && bHostOpeningSeen && Host != None && Host.Pawn != None && Host.PlayerReplicationInfo != None && ActiveCut == None && !bRestarting && !IsMenuLevel() && !IsCutsceneLevel();
 	if (bWait && !bIntroPaused)
 	{
 		bIntroPaused = true;
@@ -3498,12 +3532,224 @@ function CkptTest()
 	CkptTestStep++;
 }
 
+// Tests (EnhBagTest): see BagTestAt.
+function BagTestTick()
+{
+	local KActor K;
+	local EnhancedPlayerController PC;
+	local Vector V, HL, HN;
+	local Rotator R;
+	local int i;
+	local name Seq;
+	local float Fr, Rt, Best;
+
+	if (Level.TimeSeconds < BagTestAt || BagStep >= 8)
+	{
+		return;
+	}
+	if (Level.TimeSeconds - BagLogAt >= 0.5)
+	{
+		BagLogAt = Level.TimeSeconds;
+		for (i = 0; i < GPC.Length && BagStep >= 2 && BagStep <= 6; i++)
+		{
+			if (GPC[i] != None && GPC[i].Pawn != None)
+			{
+				GPC[i].Pawn.GetAnimParams(0, Seq, Fr, Rt);
+				Log("[BAG] guest's hero on the server at " $ string(GPC[i].Pawn.Location) $ " yaw " $ string(GPC[i].Pawn.Rotation.Yaw & 65535) $ " state "
+					$ string(GPC[i].Pawn.GetStateName()) $ " anim " $ string(Seq) $ " frame " $ string(Fr));
+				break;
+			}
+		}
+		foreach DynamicActors(Class'Engine.KActor', K)
+		{
+			if (K.IsA('PunchingBag'))
+			{
+				Log("[BAG] host t=" $ string(int((Level.TimeSeconds - BagTestAt) * 10.0)) $ " " $ string(K.Name) $ " at " $ string(K.Location) $ " rot " $ string(K.Rotation)
+					$ " state " $ string(K.GetStateName()) $ " hidden " $ string(K.bHidden) $ " hits left " $ string(KWKarmaActor(K).NumberToHit));
+			}
+		}
+	}
+	if (BagStep == 0)
+	{
+		BagStep = 1;
+		foreach DynamicActors(Class'Engine.KActor', K)
+		{
+			if (K.IsA('PunchingBag'))
+			{
+				K.KAddImpulse(vect(5000, 0, 0), K.Location);
+				T("test: the punching bag " $ string(K.Name) $ " is pushed on the host");
+			}
+		}
+	}
+	if (BagStep == 1 && Level.TimeSeconds > BagTestAt + 6.0)
+	{
+		BagStep = 2;
+		// the bag nearest above its floor (some hang high over a ledge and are hit from above)
+		Best = 100000.0;
+		foreach DynamicActors(Class'Engine.KActor', K)
+		{
+			if (K.IsA('PunchingBag') && !K.bHidden && Trace(HL, HN, K.Location + vect(-75, 0, -800), K.Location + vect(-75, 0, 0), true) != None)
+			{
+				Log("[BAG] " $ string(K.Name) $ " hangs " $ string(int(K.Location.Z - HL.Z)) $ " above the floor next to it");
+				if (K.Location.Z - HL.Z < Best)
+				{
+					Best = K.Location.Z - HL.Z;
+					BagHit = K;
+				}
+			}
+		}
+		for (i = 0; i < GPC.Length && BagHit != None; i++)
+		{
+			PC = EnhancedPlayerController(GPC[i]);
+			if (PC != None && PC.Pawn != None)
+			{
+				// on the ground under the bag's side (the bag hangs: its own height is in the air)
+				V = BagHit.Location + vect(-75, 0, 0);
+				if (Trace(HL, HN, V - vect(0, 0, 800), V, true) != None)
+				{
+					V = HL + vect(0, 0, 1) * (PC.Pawn.CollisionHeight + 4.0);
+				}
+				if (!PC.Pawn.SetLocation(V))
+				{
+					PC.Pawn.SetLocation(V + vect(0, 0, 30));
+				}
+				R = rotator(BagHit.Location - PC.Pawn.Location);
+				R.Pitch = 0;
+				R.Roll = 0;
+				PC.Pawn.SetRotation(R);
+				PC.SetRotation(R);
+				PC.ClientSetRotation(R);
+				T("test: " $ PC.PlayerReplicationInfo.PlayerName $ " put at " $ string(PC.Pawn.Location) $ " next to the punching bag " $ string(BagHit.Name) $ " at " $ string(BagHit.Location));
+				break;
+			}
+		}
+	}
+	if (BagStep >= 2 && BagStep < 6 && Level.TimeSeconds > BagTestAt + 7.0 + float(BagStep - 2))
+	{
+		BagStep++;
+		for (i = 0; i < GPC.Length; i++)
+		{
+			PC = EnhancedPlayerController(GPC[i]);
+			if (PC != None && PC.Pawn != None)
+			{
+				if (BagHit != None)
+				{
+					R = rotator(BagHit.Location - PC.Pawn.Location);
+					R.Pitch = 0;
+					R.Roll = 0;
+					PC.Pawn.SetRotation(R);
+				}
+				T("test: " $ PC.PlayerReplicationInfo.PlayerName $ "'s attack is pressed (as his attack key does)");
+				PC.ServerAction();
+				break;
+			}
+		}
+	}
+	if (BagStep == 6 && Level.TimeSeconds > BagTestAt + 14.0)
+	{
+		BagStep = 7;
+		foreach DynamicActors(Class'Engine.KActor', K)
+		{
+			if (K.IsA('PunchingBag') && !K.IsInState('stateSpawning') && !K.bHidden)
+			{
+				T("test: the punching bag " $ string(K.Name) $ " is used up on the host");
+				K.GotoState('stateSpawning');
+			}
+		}
+	}
+	if (BagStep == 7 && Level.TimeSeconds > BagTestAt + 18.0)
+	{
+		BagStep = 8;
+	}
+}
+
 function GotoTick()
 {
 	local Controller C;
 	local EnhancedLeaveBonus X;
+	local EnhancedPlayerController PC;
+	local int i;
+	local bool bPlaced;
 
 	CkptTest();
+
+	// a guest's climb that never ends (see EnhancedPlayerController.EndClimb): the server's copy is put on the climb's top after four seconds, and the guest too
+	for (i = 0; i < GPC.Length; i++)
+	{
+		PC = EnhancedPlayerController(GPC[i]);
+		if (PC == None)
+		{
+			continue;
+		}
+		if (PC.Pawn != None && PC.Pawn.Physics == PHYS_Projectile && !Class'Enhanced.EnhancedPlayerController'.static.InClimb(PC.Pawn) && !PC.Pawn.IsInState('MountHanging'))
+		{
+			if (PC.ClimbPhysSince == 0.0)
+			{
+				PC.ClimbPhysSince = Level.TimeSeconds;
+			}
+			else if (Level.TimeSeconds - PC.ClimbPhysSince > 0.4)
+			{
+				T("climb: " $ PC.PlayerReplicationInfo.PlayerName $ "'s hero kept the climbing physics after the climb at " $ string(PC.Pawn.Location) $ ": it falls again");
+				PC.Pawn.Velocity = vect(0, 0, 0);
+				PC.Pawn.SetPhysics(PHYS_Falling);
+				PC.ClimbPhysSince = 0.0;
+			}
+		}
+		else if (PC != None)
+		{
+			PC.ClimbPhysSince = 0.0;
+		}
+		if (PC.Pawn == None || !Class'Enhanced.EnhancedPlayerController'.static.InClimb(PC.Pawn))
+		{
+			PC.ClimbStuckSince = 0.0;
+			continue;
+		}
+		if (PC.ClimbStuckSince == 0.0)
+		{
+			PC.ClimbStuckSince = Level.TimeSeconds;
+		}
+		else if (Level.TimeSeconds - PC.ClimbStuckSince > 4.0)
+		{
+			T("climb: " $ PC.PlayerReplicationInfo.PlayerName $ "'s hero still in " $ string(PC.Pawn.GetStateName()) $ " after 4 s at " $ string(PC.Pawn.Location)
+				$ ", put on the climb's top " $ string(KWPawn(PC.Pawn).MountDestination));
+			Class'Enhanced.EnhancedPlayerController'.static.EndClimb(PC.Pawn);
+			PC.ClientEndClimb(PC.Pawn.Location);
+			PC.ClimbStuckSince = 0.0;
+		}
+	}
+
+	// the stump of the swamp's climbing lesson (CutSceneTrigger15 "CS_climb" at -13580,-2020): both players' climbs there had the yaw 28772 (owner's logs)
+	if (!bClimbTested && ClimbTestAt > 0.0 && Level.TimeSeconds > ClimbTestAt && ActiveCut == None && MapName() ~= "1_Shreks_Swamp")
+	{
+		for (i = 0; i < GPC.Length; i++)
+		{
+			PC = EnhancedPlayerController(GPC[i]);
+			if (PC != None && PC.Pawn != None && !PC.bLocalCutBusy)
+			{
+				bClimbTested = true;
+				bPlaced = PC.Pawn.SetLocation(vect(-13741.0, -1960.0, -60.0));
+				PC.Pawn.SetRotation(rot(0, 28772, 0));
+				PC.SetRotation(rot(0, 28772, 0));
+				PC.ClientSetRotation(rot(0, 28772, 0));
+				PC.ClientClimbTest();
+				ClimbWatch = PC;
+				ClimbWatchUntil = Level.TimeSeconds + 16.0;
+				T("climb test: " $ PC.PlayerReplicationInfo.PlayerName $ " put in front of the stump (" $ string(bPlaced) $ ")");
+				break;
+			}
+		}
+	}
+	if (ClimbWatch != None && ClimbWatch.Pawn != None && Level.TimeSeconds < ClimbWatchUntil && Level.TimeSeconds - ClimbLogAt >= 0.25)
+	{
+		ClimbLogAt = Level.TimeSeconds;
+		Log("[CLIMB] server at " $ string(ClimbWatch.Pawn.Location) $ " state " $ string(ClimbWatch.Pawn.GetStateName()) $ " phys " $ string(int(ClimbWatch.Pawn.Physics))
+			$ " base " $ string(ClimbWatch.Pawn.Base));
+	}
+
+	if (BagTestAt > 0.0)
+	{
+		BagTestTick();
+	}
 
 	if (!bBonusTested && BonusTestAt > 0.0 && Level.TimeSeconds > BonusTestAt)
 	{

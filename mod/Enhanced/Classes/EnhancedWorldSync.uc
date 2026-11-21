@@ -39,11 +39,25 @@ var int SpinYaw0[5];
 var float SpinWatchClock;
 var bool bSpinWatching;
 var int SpinWatchRuns;
+var string HiddenKarma;               // host (Part 0): the names of the level's own karma objects that the host's game has hidden, each followed by a comma
+var string HiddenKarmaDone;           // client: the list applied last
+var float KarmaClock;
+var string KarmaPose;                 // host (Part 0): "name x y z pitch yaw roll|..." of the level's karma objects that move or moved in the last 1.5 s
+var string KarmaPoseDone;             // client: the poses applied last
+var float KarmaPoseClock;
+var array<KActor> KarmaList;          // host and client: the level's own karma objects (bNoDelete, not replicated)
+var array<Vector> KarmaLoc;           // host: the last pose seen; client: the pose to go to
+var array<Rotator> KarmaRot;
+var array<float> KarmaMovedAt;        // host: when it last moved
+var bool bKarmaListed;
+var float KarmaLogAt;                 // client (tests): the copies' poses go to the log at most twice a second while poses arrive ([BAG] client)
 
 replication
 {
 	reliable if (Role == ROLE_Authority)
-		Rec;
+		Rec, HiddenKarma, Part;
+	unreliable if (Role == ROLE_Authority)
+		KarmaPose;
 	unreliable if (Role == ROLE_Authority)
 		Pos;
 }
@@ -80,7 +94,9 @@ function int HashOf(Actor A)
 
 function bool Twinnable(Actor A)
 {
-	if (A == None || A == self || A.bStatic || A.bDeleteMe || A.RemoteRole != ROLE_None || A.bNetTemporary)
+	// bNoDelete: the client keeps the map's own copy (torches, pollen, fires); a twin of such a class cannot even be spawned ("SpawnActor failed because
+	// class Env_Torch has bStatic or bNoDelete", 78 times in a guest's log of 2026-11-21)
+	if (A == None || A == self || A.bStatic || A.bNoDelete || A.bDeleteMe || A.RemoteRole != ROLE_None || A.bNetTemporary)
 	{
 		return false;
 	}
@@ -322,6 +338,203 @@ function Refresh()
 	}
 }
 
+// The level's own karma objects (KActor: the punching bag of the swamp, the other things that give coins when hit) are not replicated, and the client
+// keeps his own copy of each. When the host's one is used up the game hides it and takes its collision away (KarmaSpawning.stateSpawning); the guest's
+// copy stayed (owner, 2026-11-21: "the punching bag vanishes when someone hits it, the client still has it"). The host sends the names of the hidden
+// ones; the client hides his copies the same way.
+function HiddenKarmaRefresh()
+{
+	local KActor K;
+	local string S;
+
+	foreach DynamicActors(Class'Engine.KActor', K)
+	{
+		if (K.bHidden && K.bNoDelete && K.RemoteRole == ROLE_None)
+		{
+			S = S $ string(K.Name) $ ",";
+		}
+	}
+	if (S != HiddenKarma && Len(S) < 900)
+	{
+		HiddenKarma = S;
+	}
+}
+
+// The level's karma objects swing and roll on the host only (Karma physics, not replicated): a guest saw the punching bag stand still under the host's
+// blows and vanish without a swing (owner, 2026-11-21: "the client must see the host hit the bag and it vanish with its effects, and the other way
+// round"). Every hit is worked out on the server (the guests' attacks run there: ServerAction), so the server's poses are the truth: while an object
+// moves (and 1.5 s after), the host sends its pose ten times a second; the guest's copy has no physics of its own and goes to that pose. A guest's
+// copy of a coin-giving object never breaks by itself (his game's own hit code may run on it): it vanishes when the host's does (HiddenKarma), and the
+// coins come from the host (pickups are replicated).
+simulated function ListKarma()
+{
+	local KActor K;
+	local int n;
+
+	bKarmaListed = true;
+	foreach DynamicActors(Class'Engine.KActor', K)
+	{
+		if (n < 3 && Role < ROLE_Authority)
+		{
+			n++;
+			Log("[WSY] karma object on the client: " $ string(K.Name) $ " role " $ string(int(K.Role)) $ " remote role " $ string(int(K.RemoteRole)) $ " no delete " $ string(K.bNoDelete));
+		}
+		// host: the map's own, never replicated; client: the map's own copies, whatever role the engine gave them, but not one that comes from the server
+		if (K.bNoDelete && KarmaList.Length < 40 && ((Role == ROLE_Authority && K.RemoteRole == ROLE_None)
+			|| (Role < ROLE_Authority && K.Role != ROLE_SimulatedProxy && K.Role != ROLE_DumbProxy && K.Role != ROLE_AutonomousProxy)))
+		{
+			KarmaList[KarmaList.Length] = K;
+			KarmaLoc[KarmaLoc.Length] = K.Location;
+			KarmaRot[KarmaRot.Length] = K.Rotation;
+			KarmaMovedAt[KarmaMovedAt.Length] = -10.0;
+			if (Role < ROLE_Authority)
+			{
+				K.SetPhysics(PHYS_None);
+				if (KWKarmaActor(K) != None)
+				{
+					KWKarmaActor(K).NumberToHit = 100000;
+				}
+			}
+		}
+	}
+	Log("[WSY] karma objects of the level: " $ string(KarmaList.Length) $ " (" $ string(Role == ROLE_Authority) $ ")");
+}
+
+simulated function int RotGap(Rotator A, Rotator B)
+{
+	return Max(Max(Abs((((A.Pitch - B.Pitch) + 32768) & 65535) - 32768), Abs((((A.Yaw - B.Yaw) + 32768) & 65535) - 32768)), Abs((((A.Roll - B.Roll) + 32768) & 65535) - 32768));
+}
+
+function KarmaPoseRefresh()
+{
+	local int i;
+	local KActor K;
+	local string S;
+
+	for (i = 0; i < KarmaList.Length; i++)
+	{
+		K = KarmaList[i];
+		if (K == None || K.bDeleteMe || K.bHidden)
+		{
+			continue;
+		}
+		if (VSize(K.Location - KarmaLoc[i]) > 0.5 || RotGap(K.Rotation, KarmaRot[i]) > 60)
+		{
+			KarmaLoc[i] = K.Location;
+			KarmaRot[i] = K.Rotation;
+			KarmaMovedAt[i] = Level.TimeSeconds;
+		}
+		if (Level.TimeSeconds - KarmaMovedAt[i] < 1.5 && Len(S) < 850)
+		{
+			S = S $ string(K.Name) $ " " $ string(int(K.Location.X)) $ " " $ string(int(K.Location.Y)) $ " " $ string(int(K.Location.Z)) $ " "
+				$ string(K.Rotation.Pitch & 65535) $ " " $ string(K.Rotation.Yaw & 65535) $ " " $ string(K.Rotation.Roll & 65535) $ "|";
+		}
+	}
+	KarmaPose = S;
+}
+
+simulated function KarmaPoseApply()
+{
+	local string S, E, N;
+	local int i;
+
+	KarmaPoseDone = KarmaPose;
+	S = KarmaPose;
+	if (Level.TimeSeconds - KarmaLogAt >= 0.5)
+	{
+		KarmaLogAt = Level.TimeSeconds;
+		for (i = 0; i < KarmaList.Length; i++)
+		{
+			if (KarmaList[i] != None && KarmaList[i].IsA('PunchingBag'))
+			{
+				Log("[BAG] client " $ string(KarmaList[i].Name) $ " at " $ string(KarmaList[i].Location) $ " rot " $ string(KarmaList[i].Rotation) $ " hidden " $ string(KarmaList[i].bHidden)
+					$ " phys " $ string(int(KarmaList[i].Physics)));
+			}
+		}
+	}
+	while (S != "")
+	{
+		E = Field(S, "|");
+		N = Field(E, " ");
+		for (i = 0; i < KarmaList.Length; i++)
+		{
+			if (KarmaList[i] != None && string(KarmaList[i].Name) == N)
+			{
+				KarmaLoc[i].X = float(Field(E, " "));
+				KarmaLoc[i].Y = float(Field(E, " "));
+				KarmaLoc[i].Z = float(Field(E, " "));
+				KarmaRot[i].Pitch = int(Field(E, " "));
+				KarmaRot[i].Yaw = int(Field(E, " "));
+				KarmaRot[i].Roll = int(Field(E, " "));
+				if (KarmaList[i].Physics != PHYS_None)
+				{
+					KarmaList[i].SetPhysics(PHYS_None);
+				}
+				break;
+			}
+		}
+	}
+}
+
+simulated function int Toward(int A, int B, float Alpha)
+{
+	local int D;
+
+	D = (((B - A) + 32768) & 65535) - 32768;
+	return A + int(float(D) * Alpha);
+}
+
+// client: every frame each copy goes a part of the way to the host's last pose
+simulated function KarmaPoseMove(float DeltaTime)
+{
+	local int i;
+	local KActor K;
+	local Rotator R;
+	local float Alpha;
+
+	Alpha = FMin(1.0, DeltaTime * 12.0);
+	for (i = 0; i < KarmaList.Length; i++)
+	{
+		K = KarmaList[i];
+		if (K == None || K.bHidden)
+		{
+			continue;
+		}
+		if (VSize(K.Location - KarmaLoc[i]) > 0.3)
+		{
+			K.SetLocation(K.Location + (KarmaLoc[i] - K.Location) * Alpha);
+		}
+		R = K.Rotation;
+		if (RotGap(R, KarmaRot[i]) > 8)
+		{
+			R.Pitch = Toward(R.Pitch, KarmaRot[i].Pitch, Alpha);
+			R.Yaw = Toward(R.Yaw, KarmaRot[i].Yaw, Alpha);
+			R.Roll = Toward(R.Roll, KarmaRot[i].Roll, Alpha);
+			K.SetRotation(R);
+		}
+	}
+}
+
+simulated function HiddenKarmaApply()
+{
+	local KActor K;
+	local string L;
+
+	HiddenKarmaDone = HiddenKarma;
+	L = "," $ HiddenKarma;
+	foreach DynamicActors(Class'Engine.KActor', K)
+	{
+		if (!K.bHidden && InStr(L, "," $ string(K.Name) $ ",") >= 0)
+		{
+			K.bHidden = true;
+			K.SetCollision(false, false, false);
+			K.bCollideWorld = false;
+			K.SetPhysics(PHYS_None);
+			Log("[WSY] karma object " $ string(K.Name) $ " hidden as on the host");
+		}
+	}
+}
+
 simulated function KillTwin(int i)
 {
 	if (Twin[i] != None)
@@ -530,7 +743,39 @@ simulated event Tick(float DeltaTime)
 			Clock = 0.0;
 			Refresh();
 		}
+		KarmaClock += DeltaTime;
+		if (Part == 0 && KarmaClock >= 1.0)
+		{
+			KarmaClock = 0.0;
+			HiddenKarmaRefresh();
+		}
+		KarmaPoseClock += DeltaTime;
+		if (Part == 0 && KarmaPoseClock >= 0.1)
+		{
+			KarmaPoseClock = 0.0;
+			if (!bKarmaListed)
+			{
+				ListKarma();
+			}
+			KarmaPoseRefresh();
+		}
 		return;
+	}
+	if (Part == 0)
+	{
+		if (!bKarmaListed)
+		{
+			ListKarma();
+		}
+		if (KarmaPose != KarmaPoseDone)
+		{
+			KarmaPoseApply();
+		}
+		KarmaPoseMove(DeltaTime);
+	}
+	if (HiddenKarma != HiddenKarmaDone)
+	{
+		HiddenKarmaApply();
 	}
 	if (bSpinWatching)
 	{

@@ -698,7 +698,8 @@ class Installer
         }
     }
 
-    // The headings of the mod's pages use a font entry (ShrekTitle) of SAPFont: Tahoma, or the Shrek face when the player has put Shrekrusbyme.ttf into System.
+    // The headings of the mod's pages use font entries of SAPFont (ShrekTitle and two smaller sizes): Tahoma, or the Shrek face when the player has put
+    // Shrekrusbyme.ttf into System.
     void Fonts()
     {
         string face = File.Exists(P("Shrekrusbyme.ttf")) ? "Shrek" : "Tahoma";
@@ -707,9 +708,14 @@ class Installer
             if (!File.Exists(f)) continue;
             Encoding enc;
             string text = ReadKeep(f, out enc);
-            text = Regex.Replace(text, "(?m)\\r?\\nShrekTitle(Size)?=.*", "");
+            text = Regex.Replace(text, "(?m)\\r?\\n(ShrekTitle(Small|Tiny)?|EnhPlain1[24])(Size)?=.*", "");
             if (!File.Exists(f + Bak)) AtomicCopy(f, f + Bak);
-            text = text.TrimEnd() + "\r\nShrekTitle=" + face + "\r\nShrekTitleSize=29";
+            // two smaller sizes for headings that do not fit their page (the menu drops to them by itself, EnhancedMenuFit)
+            text = text.TrimEnd() + "\r\nShrekTitle=" + face + "\r\nShrekTitleSize=29"
+                + "\r\nShrekTitleSmall=" + face + "\r\nShrekTitleSmallSize=22"
+                + "\r\nShrekTitleTiny=" + face + "\r\nShrekTitleTinySize=17"
+                // plain faces for a menu caption that the ink faces cannot fit on its page
+                + "\r\nEnhPlain14=Tahoma\r\nEnhPlain14Size=14\r\nEnhPlain12=Tahoma\r\nEnhPlain12Size=12";
             AtomicWriteAllText(f, text, enc);
         }
         Log("Fonts: ShrekTitle = " + face);

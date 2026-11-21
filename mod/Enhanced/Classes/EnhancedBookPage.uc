@@ -49,7 +49,7 @@ function GUILabel MakeLabel(bool bBig)
 	}
 	else
 	{
-		L.StyleName = "SH12AuptimaghBlack";
+		L.StyleName = "SH12Auptimagh";   // the book's brown ink, as its buttons (the black style stood out)
 	}
 	L.Style = Controller.GetStyle(L.StyleName);
 	L.TextAlign = TXTA_Center;

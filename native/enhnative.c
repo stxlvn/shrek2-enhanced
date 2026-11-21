@@ -1953,6 +1953,85 @@ static void __attribute__((thiscall)) nat_netclient(void *self, FFrame *stack, v
 	g_netClientTick = on ? (GetTickCount() | 1) : 0;
 }
 
+/* ---- 3543 EnhListen() -> "" or the engine's error: the level that is loaded now becomes a listen server --------------------------------
+ * The engine opens its network side only while a level loads ("?listen" in the URL): "Create a game" loaded the menu level again, and the owner
+ * did not want the game to restart when he goes into the co-op lobby. ULevel::Listen (exported by Engine.dll) is what LoadMap calls for "?listen":
+ * it makes the net driver, opens the port of the level's URL, builds the package map for clients and sets LevelInfo.NetMode to a listen server.
+ * Called here for the level of the actor that runs the native ("MyLevel" in the actor's map package). The level stays a listen server until the next level change. */
+typedef int (__attribute__((thiscall)) *ListenFn)(void *level, void *error);
+
+static void __attribute__((thiscall)) nat_listen(void *self, FFrame *stack, void *result)
+{
+	struct { unsigned short *data; int num, max; } err = { NULL, 0, 0 };
+	char msg[200];
+	ListenFn listen;
+	FindObjFn find;
+	void *level = NULL, *lvlClass;
+	unsigned short *w;
+	int ok = 0, n = 0, i;
+	stack->code++;
+	((unsigned short **)result)[0] = NULL;
+	((int *)result)[1] = 0;
+	((int *)result)[2] = 0;
+	listen = (ListenFn)GetProcAddress(GetModuleHandleA("Engine.dll"), "?Listen@ULevel@@UAEHAAVFString@@@Z");
+	lvlClass = (void *)GetProcAddress(GetModuleHandleA("Engine.dll"), "?PrivateStaticClass@ULevel@@0VUClass@@A");
+	find = (FindObjFn)GetProcAddress(GetModuleHandleA("Core.dll"), "?StaticFindObject@UObject@@SAPAV1@PAVUClass@@PAV1@PBGH@Z");
+	/* the level object of a map is "<map package>.MyLevel"; an actor's Outer (UObject+0x18) is that package */
+	if (find && lvlClass && self && *(void **)((unsigned char *)self + 0x18))
+		level = find(lvlClass, *(void **)((unsigned char *)self + 0x18), (const unsigned short *)L"MyLevel", 0);
+	if (!listen || !level || (fn_IsA && lvlClass && !fn_IsA(level, lvlClass))) {
+		n = snprintf(msg, sizeof msg, "no level to listen on (Listen %p, level %p)", (void *)listen, level);
+	} else {
+		ok = listen(level, &err);
+		if (ok) {
+			n = 0;
+		} else {
+			n = snprintf(msg, sizeof msg, "Listen failed: ");
+			for (i = 0; err.data && err.data[i] && n < (int)sizeof msg - 1; i++)
+				msg[n++] = (char)(err.data[i] < 128 ? err.data[i] : '?');
+			msg[n] = 0;
+			if (n == 15)
+				n = snprintf(msg, sizeof msg, "Listen failed");
+		}
+	}
+	enh_log("listen: %s", ok ? "the level is a listen server now" : msg);
+	if (ok || n <= 0 || !(w = (unsigned short *)eng_malloc((unsigned long)(n + 1) * 2)))
+		return;
+	for (i = 0; i <= n; i++)
+		w[i] = (unsigned char)msg[i];
+	((unsigned short **)result)[0] = w;
+	((int *)result)[1] = n + 1;
+	((int *)result)[2] = n + 1;
+}
+
+/* ---- 3544 EnhTextWidth(Canvas C, GUIStyles Style, string Text) -> pixels: how wide a menu style draws a text ----------------------------------
+ * The menu fitter (EnhancedMenuFit) needs the width of a caption in the face its style uses at this resolution. The script's GUIFont.GetFont is declared
+ * otherwise in the older classes the mod compiles against (no Canvas parameter), so the width is asked from the style itself: UGUIStyles::TextSize,
+ * exported by GUI.dll, measures with the style's own font for the canvas (menu state 0). */
+typedef void (__attribute__((thiscall)) *StyleTextSizeFn)(void *style, void *canvas, unsigned char state, const unsigned short *text, int *xl, int *yl);
+static StyleTextSizeFn fn_StyleTextSize;
+
+static void __attribute__((thiscall)) nat_textwidth(void *self, FFrame *stack, void *result)
+{
+	struct { unsigned short *data; int num, max; } s = { NULL, 0, 0 };
+	void *canvas = NULL, *style = NULL;
+	int xl = 0, yl = 0;
+	(void)self;
+	fn_Step(stack, stack->object, &canvas);
+	fn_Step(stack, stack->object, &style);
+	fn_Step(stack, stack->object, &s);
+	stack->code++;
+	if (!fn_StyleTextSize) {
+		HMODULE gui = GetModuleHandleA("GUI.dll");
+		if (gui)
+			fn_StyleTextSize = (StyleTextSizeFn)GetProcAddress(gui, "?TextSize@UGUIStyles@@QAEXPAVUCanvas@@EPBGAAH2@Z");
+	}
+	if (fn_StyleTextSize && canvas && style && s.data && s.num > 0)
+		fn_StyleTextSize(style, canvas, 0, s.data, &xl, &yl);
+	*(int *)result = xl;
+	eng_free(s.data);
+}
+
 /* ---- Network: byte counters, and (tests only) packet loss and lag --------------------------------------------------------
  * IpDrv.dll sends and receives the game's UDP through WSOCK32 (sendto / recvfrom, imported by ordinal). Once IpDrv.dll is loaded a thread
  * replaces those two entries of its import table. Every second, while there is traffic, enhnative.log gets one "[NET]" line per process:
@@ -2187,6 +2266,8 @@ static void native_init(void)
 	register_native(table, 3535, nat_deaf, undef);
 	register_native(table, 3541, nat_herohost, undef);
 	register_native(table, 3542, nat_netclient, undef);
+	register_native(table, 3543, nat_listen, undef);
+	register_native(table, 3544, nat_textwidth, undef);
 	register_native(table, 3536, nat_musicwatch, undef);
 	register_native(table, 3537, nat_musicpoll, undef);
 	register_native(table, 3538, nat_playmusic, undef);

@@ -1588,6 +1588,7 @@ event PlayerTick(float DeltaTime)
 		bOverlayAdded = true;
 		Player.InteractionMaster.AddInteraction("Enhanced.EnhancedGuestOverlay", Player);
 	}
+	Class'Enhanced.EnhancedMenuFit'.static.Ensure(self);
 	if (Level.NetMode == NM_Client && !bNickSent && Player != None && PlayerReplicationInfo != None)
 	{
 		NickClock += DeltaTime;

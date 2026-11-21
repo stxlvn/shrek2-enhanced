@@ -241,7 +241,11 @@ function bool InternalOnClick(GUIComponent Sender)
 		PlayerOwner().PlaySound(sfxClick);
 		if (IsHost())
 		{
-			Game().CloseLobby(PlayerOwner());
+			// in place: back to the co-op page (the menu level was not loaded again)
+			if (Game().CloseLobby(PlayerOwner()))
+			{
+				TurnTo("Enhanced.EnhancedLobbyPage", false);
+			}
 		}
 		else
 		{

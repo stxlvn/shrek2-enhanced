@@ -267,7 +267,6 @@ function Place(GUIComponent C, float L, float T, float W, float H)
 function FixSettingsPage(GUIController GC)
 {
 	local Tab_OptionsVideo V;
-	local float XL, XR, W, T0, P, LH, CH;
 
 	if (bDropRelease && Tab_Options(GC.ActivePage) != None)
 	{
@@ -321,27 +320,8 @@ function FixSettingsPage(GUIController GC)
 			}
 			FixedPage.tabOptions.ActiveTab.ChangeActiveState(true, true);
 		}
-		XL = 0.2608;
-		XR = 0.5107;
-		W = 0.2207;
-		T0 = 0.06;
-		P = 0.165;
-		LH = 0.05;
-		CH = 0.05;
-		// left column: brightness, texture detail, object detail; right column: resolution, anti-aliasing, anisotropy
-		Place(V.lblBrightness, XL, T0, W, LH);
-		Place(V.sldBrightness, XL, T0 + LH, W, CH);
-		Place(V.lblTextureDetail, XL, T0 + P, W, LH);
-		Place(V.cbTextureDetail, XL, T0 + P + LH, W, CH);
-		Place(V.lblObjectDetail, XL, T0 + P * 2.0, W, LH);
-		Place(V.cbObjectDetail, XL, T0 + P * 2.0 + LH, W, CH);
-		Place(V.lblResolution, XR, T0, W, LH);
-		Place(V.cbResolution, XR, T0 + LH, W, CH);
-		Place(V.lblColorDepth, XR, T0 + P, W, LH);
-		Place(V.cbColorDepth, XR, T0 + P + LH, W, CH);
-		Place(V.lblRenderer, XR, T0 + P * 2.0, W, LH);
-		Place(V.cbRenderer, XR, T0 + P * 2.0 + LH, W, CH);
-		Place(V.btnApplyVideoChanges, XR, T0 + P * 3.0 + 0.02, W, CH);
+		// the places of every control of the three tabs (also for the guests' settings page): EnhancedMenuFit.LayoutOptions
+		Class'Enhanced.EnhancedMenuFit'.static.LayoutOptions(FixedPage);
 		V.lblTextureDetail.Caption = Localize("Menu", "Textures", "Enhanced");
 		V.lblObjectDetail.Caption = Localize("Menu", "Objects", "Enhanced");
 		V.lblColorDepth.Caption = Localize("Menu", "AA", "Enhanced");
@@ -356,6 +336,7 @@ function FixSettingsPage(GUIController GC)
 		V.cbRenderer.Edit.bVisible = true;
 		V.lblRenderer.bVisible = true;
 	}
+	Class'Enhanced.EnhancedMenuFit'.static.ShortKeyNames(FixedPage.GameTab);
 	// the stock page fills these two lists with the bit depth and the renderer again whenever it refreshes: filled again until they are ours
 	if (!bAASet)
 	{
@@ -650,9 +631,50 @@ function LogMenuGeometry()
 	}
 }
 
+// Tests: a button of the pause menu's page pressed by name.
+function PressPauseMenu(string What)
+{
+	local ShInGameMenuControls M;
+	local GUIButton B;
+
+	if (Player == None || GUIController(Player.GUIController) == None)
+	{
+		return;
+	}
+	M = ShInGameMenuControls(GUIController(Player.GUIController).ActivePage);
+	if (M == None)
+	{
+		Log("[SDBG] test: the pause menu is not the open page");
+		return;
+	}
+	if (What ~= "options")
+	{
+		B = M.btnOptions;
+	}
+	else if (What ~= "posters")
+	{
+		B = M.btnWanterPoster;
+	}
+	else if (What ~= "main")
+	{
+		B = M.btnMainMenu;
+	}
+	else if (What ~= "quit")
+	{
+		B = M.btnQuit;
+	}
+	if (B != None)
+	{
+		Log("[SDBG] test: the pause menu's " $ What $ " button is pressed");
+		M.InternalOnClick(B);
+	}
+}
+
 event PlayerTick(float DeltaTime)
 {
 	local GUIController GC;
+
+	Class'Enhanced.EnhancedMenuFit'.static.Ensure(self);
 
 	if (!bHostMenuDone && EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).HostMenuAt > 0.0 && Level.TimeSeconds > EnhancedGame(Level.Game).HostMenuAt && Pawn != None)
 	{
@@ -671,6 +693,17 @@ event PlayerTick(float DeltaTime)
 		{
 			ConsoleCommand("shot");
 			Log("[SDBG] test: picture of the host's pause menu");
+		}
+		// EnhHostMenuPage=options|posters|main|quit: then that button of the pause menu is pressed (the page turns as for a player) and the next
+		// page is taken too
+		if (HostMenuFrames == 260 && EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).HostMenuPage != "")
+		{
+			PressPauseMenu(EnhancedGame(Level.Game).HostMenuPage);
+		}
+		if (HostMenuFrames == 560 && EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).HostMenuPage != "")
+		{
+			ConsoleCommand("shot");
+			Log("[SDBG] test: picture of the pause menu's settings page");
 		}
 	}
 	HostMenuWatch();

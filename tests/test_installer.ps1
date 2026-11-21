@@ -57,6 +57,14 @@ try {
     $ub = [IO.File]::ReadAllBytes($ui)
     Assert (($ub[0] -eq 0xFF) -and ($ub[1] -eq 0xFE)) 'User.ini is still UTF-16 after the install'
     Assert ([IO.File]::ReadAllText($ui).Contains($nameRu)) 'the Cyrillic name is still in User.ini'
+    # the menu's heading and fallback faces (a caption that does not fit its page drops to them): every entry once, in both font lists
+    foreach ($sf in "$sys\SAPFont.rus", "$sys\SAPFont.int") {
+        if (-not (Test-Path $sf)) { continue }
+        $ft = [IO.File]::ReadAllText($sf)
+        foreach ($k in 'ShrekTitle', 'ShrekTitleSmall', 'ShrekTitleTiny', 'EnhPlain14', 'EnhPlain12') {
+            Assert (([regex]::Matches($ft, "(?m)^$k=").Count -eq 1) -and ([regex]::Matches($ft, "(?m)^${k}Size=\d+").Count -eq 1)) "$(Split-Path $sf -Leaf) has $k and its size once"
+        }
+    }
     $inst = Snap
     Run @('/silent', '/dir', $game, '/textures', 'ru'); Assert ($code -eq 0) 'second install'
     Assert ((TreeDiff $inst (Snap)).Count -eq 0) 'second install changes nothing'

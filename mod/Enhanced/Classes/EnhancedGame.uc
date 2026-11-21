@@ -129,6 +129,7 @@ var bool bBonusTested;
 var float GotoAt;                    // URL option EnhGotoAt=<seconds> (with EnhGoto=<map>): in the front-end level the host's controller opens that map by itself (tests: the path from the main menu into a level)
 var string GotoMap;
 var bool bGotoDone;
+var string HostMenuPage;           // URL option EnhHostMenuPage=options (tests): the pause menu's settings page is opened instead of the pause menu
 var float HostMenuAt;               // URL option EnhHostMenu=<seconds>: the host's own pause menu is opened by itself at that level time (tests)
 var bool bJumpTestOpt;           // URL option EnhJumpTest: the host's Shrek jumps and double jumps by the clock, the height and the air time are logged (tests of the frame rate)
 var int JtState;
@@ -207,6 +208,7 @@ var int LobbyMin;                // fewest players to start a co-op game
 var int LobbyMax;                // most players in a lobby (the game itself plays for two so far; 4 is planned)
 const FirstMap = "1_Shreks_Swamp";
 var EnhancedLanBeacon Beacon;   // LAN discovery: answers when hosting, searches in the menu
+var bool bMenuDump;              // URL option EnhMenuDump (tests): the menu fitter logs every component's place on the screen ([MENUBOX])
 var string MenuScript;           // URL option EnhMenu=coop;lan;...: tests press menu buttons one by one
 var bool bLaunching;             // the host pressed Start: nobody else may join (a guest connecting while the level changes crashed his client)
 var string SessionId;            // URL option EnhSession: the co-op game this level belongs to (its save slot is coop_<id>)
@@ -229,6 +231,7 @@ native(3534) final function int EnhHeroStats();
 native(3535) final function EnhDeaf(PlayerController PC, int On);
 native(3541) final function int EnhHeroHost(string Path);
 native(3542) final function EnhNetClient(int On);
+native(3543) final function string EnhListen();   // the loaded level becomes a listen server: "" or the engine's error (enhnative.c)
 native(3536) final function EnhMusicWatch(int On);
 native(3537) final function string EnhMusicPoll();
 
@@ -267,6 +270,7 @@ event InitGame(string Options, out string Error)
 	bFpsOpt = ParseOption(Options, "EnhFps") != "";
 	bJumpTestOpt = ParseOption(Options, "EnhJumpTest") != "";
 	HostMenuAt = float(ParseOption(Options, "EnhHostMenu"));
+	HostMenuPage = ParseOption(Options, "EnhHostMenuPage");
 	GotoAt = float(ParseOption(Options, "EnhGotoAt"));
 	BonusTestAt = float(ParseOption(Options, "EnhBonusAt"));
 	CkptTestAt = float(ParseOption(Options, "EnhCkptTest"));
@@ -293,6 +297,7 @@ event InitGame(string Options, out string Error)
 	LobbyMode = ParseOption(Options, "Lobby");
 	SessionId = ParseOption(Options, "EnhSession");
 	MenuScript = ParseOption(Options, "EnhMenu");
+	bMenuDump = ParseOption(Options, "EnhMenuDump") != "";
 	bLobbyUpnp = ParseOption(Options, "Upnp") != "";
 	NetTestMode = ParseOption(Options, "EnhNet");
 	GateTestMode = ParseOption(Options, "EnhGateTest");
@@ -341,20 +346,7 @@ event PostBeginPlay()
 	}
 	if (LobbyMode == "host")
 	{
-		MaxPlayers = Clamp(Class'Enhanced.EnhancedLobbySettings'.default.MaxPlayers, LobbyMin, LobbyMax);
-		GameReplicationInfo.GoalScore = MaxPlayers;   // carries the number of places to the guests' room page
-		GameReplicationInfo.ServerName = Class'Enhanced.EnhancedLobbySettings'.default.LobbyName;
-		if (Class'Enhanced.EnhancedLobbySettings'.default.bFriendlyFire)
-		{
-			FriendlyFire = 1.0;
-		}
-		Beacon = Spawn(Class'Enhanced.EnhancedLanBeacon');
-		Beacon.StartHost(HostLine());
-		if (bLobbyUpnp)
-		{
-			Upnp = Spawn(Class'Enhanced.EnhancedUpnp');
-			Upnp.Start(GamePortDefault, UpnpTarget);
-		}
+		StartHostLobby();
 	}
 	else if (NetTestMode == "upnp" || NetTestMode == "upnpmap")
 	{
@@ -1887,30 +1879,105 @@ function StopLanSearch()
 	}
 }
 
-// "Create a game": the front-end level is loaded again as a listen server; the lobby page opens in it.
-function OpenLobby(PlayerController PC, bool bUpnp)
+// The host's lobby: the places, the name the guests see, friendly fire, the LAN answer and (UPnP) the port on the router. Run when the front-end
+// level is loaded as a lobby (?Lobby=host) or turned into one in place (OpenLobby).
+function StartHostLobby()
 {
-	local string Opt;
+	MaxPlayers = Clamp(Class'Enhanced.EnhancedLobbySettings'.default.MaxPlayers, LobbyMin, LobbyMax);
+	GameReplicationInfo.GoalScore = MaxPlayers;   // carries the number of places to the guests' room page
+	GameReplicationInfo.ServerName = Class'Enhanced.EnhancedLobbySettings'.default.LobbyName;
+	FriendlyFire = 0.0;
+	if (Class'Enhanced.EnhancedLobbySettings'.default.bFriendlyFire)
+	{
+		FriendlyFire = 1.0;
+	}
+	if (Beacon == None)
+	{
+		Beacon = Spawn(Class'Enhanced.EnhancedLanBeacon');
+	}
+	Beacon.StartHost(HostLine());
+	if (bLobbyUpnp && Upnp == None)
+	{
+		Upnp = Spawn(Class'Enhanced.EnhancedUpnp');
+		Upnp.Start(GamePortDefault, UpnpTarget);
+	}
+}
+
+// "Create a game". Owner's wish (2026-11-21): the game must not restart when he goes into the co-op lobby. The menu level becomes a listen server
+// where it is (native 3543 EnhListen, the engine's own ULevel::Listen) and the room page opens at once: true. Only if that fails (or with
+// ?EnhOff=listennow) the front-end level is loaded again as a listen server, as before: false.
+function bool OpenLobby(PlayerController PC, bool bUpnp)
+{
+	local string Opt, E;
 
 	StopLanSearch();
+	Class'Enhanced.EnhancedLobbySettings'.static.Save();
+	if (IsMenuLevel() && !Off("listennow") && (Level.NetMode == NM_Standalone || Level.NetMode == NM_ListenServer))
+	{
+		if (Level.NetMode == NM_Standalone)
+		{
+			E = EnhListen();
+		}
+		if (Level.NetMode == NM_ListenServer)
+		{
+			LobbyMode = "host";
+			bLobbyUpnp = bUpnp;
+			bLaunching = false;
+			StartHostLobby();
+			T("lobby: opened in place (the menu level listens now), no level load");
+			return true;
+		}
+		T("lobby: the menu level could not listen (" $ E $ "), it is loaded again as a listen server");
+	}
 	Opt = "";
 	if (bUpnp)
 	{
 		Opt = "?Upnp=1";
 	}
-	Class'Enhanced.EnhancedLobbySettings'.static.Save();
 	PC.ConsoleCommand("open Book_FrontEnd.unr?Game=Enhanced.EnhancedGame?listen?Lobby=host" $ Opt);
+	return false;
 }
 
-function CloseLobby(PlayerController PC)
+// The host closes his lobby. In place: the guests go back to their own menus, the LAN answer and the router port are given up, and the level
+// stays a listen server that refuses every join (PreLogin: "The host has closed the lobby"); true, the page turns back. Otherwise the plain menu
+// is loaded: false.
+function bool CloseLobby(PlayerController PC)
 {
+	local Controller C;
+	local PlayerController G;
+
 	Class'Enhanced.EnhancedLobbySettings'.default.Password = "";
 	Class'Enhanced.EnhancedLobbySettings'.static.Save();
 	if (Upnp != None)
 	{
 		Upnp.Release();
 	}
+	if (IsMenuLevel() && !Off("listennow") && Level.NetMode == NM_ListenServer)
+	{
+		LobbyMode = "";
+		for (C = Level.ControllerList; C != None; C = C.NextController)
+		{
+			G = PlayerController(C);
+			if (G != None && IsGuestPC(G))
+			{
+				G.ClientTravel(PlainMenuURL(), TRAVEL_Absolute, false);
+			}
+		}
+		if (Beacon != None)
+		{
+			Beacon.Destroy();
+			Beacon = None;
+		}
+		if (Upnp != None)
+		{
+			Upnp.Destroy();
+			Upnp = None;
+		}
+		T("lobby: closed in place, the guests go back to their menus");
+		return true;
+	}
 	PC.ConsoleCommand("open " $ PlainMenuURL());
+	return false;
 }
 
 // The plain main menu. A relative "open" keeps the options of the URL that is open now, so the lobby's own options have to be cleared by name:

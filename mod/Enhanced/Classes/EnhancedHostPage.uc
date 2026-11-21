@@ -89,7 +89,11 @@ function bool InternalOnClick(GUIComponent Sender)
 		Class'Enhanced.EnhancedLobbySettings'.default.Password = edPass.TextStr;
 		Class'Enhanced.EnhancedLobbySettings'.default.bFriendlyFire = bFF;
 		Class'Enhanced.EnhancedLobbySettings'.default.MaxPlayers = Places;
-		Game().OpenLobby(PlayerOwner(), Class'Enhanced.EnhancedLobbySettings'.default.bUpnp);
+		// in place: the room page opens at once (the menu level was not loaded again)
+		if (Game().OpenLobby(PlayerOwner(), Class'Enhanced.EnhancedLobbySettings'.default.bUpnp))
+		{
+			TurnTo("Enhanced.EnhancedRoomPage", true);
+		}
 	}
 	else if (Sender == btnBack)
 	{

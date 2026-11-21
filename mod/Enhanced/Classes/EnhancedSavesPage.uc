@@ -22,7 +22,17 @@ function InitComponent(GUIController MyController, GUIComponent MyOwner)
 	btnBack.WinWidth = Mb.controlBut_W;
 	btnBack.WinHeight = Mb.controlBut_H;
 	btnBack.WinTop = btnDelete.WinTop + btnDelete.WinHeight + Mb.controlBut_VGAP;
-	lblStartGame.Caption = Localize("Menu", "SavesTitle", "Enhanced");
+	// the stock hint ran over both pages in white: a shorter line in the black ink of the mod's pages, on the right page (owner, 2026-11-21:
+	// all the content of a menu on one page); the delete button's stock caption ran over its icon
+	lblStartGame.Caption = Localize("Menu", "SlotHint", "Enhanced");
+	lblStartGame.StyleName = "SH12Auptimagh";
+	lblStartGame.Style = Controller.GetStyle("SH12Auptimagh");
+	lblStartGame.TextAlign = TXTA_Center;
+	lblStartGame.WinLeft = 0.31;
+	lblStartGame.WinWidth = 0.39;
+	lblStartGame.WinTop = 0.49;
+	lblStartGame.WinHeight = 0.035;
+	btnDelete.Caption = Localize("Menu", "DeleteSave", "Enhanced");
 }
 
 // ---- The slots show the mod's checkpoint records ("slot0" .. "slot5", written by EnhancedGame.FinishCheckpoint), not the stock save files ----

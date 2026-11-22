@@ -8,6 +8,8 @@ Creating a co-op game opens the lobby at once: the menu level starts listening w
 
 Full screen runs as a borderless window over the whole monitor, so Alt+Tab or minimising never leaves a black screen (`Borderless=False` in `Game.ini` keeps the old exclusive full screen). The anti-aliasing list of the video settings works on the system's Direct3D 8. The level's physics objects (the punching bags and the like) swing and vanish the same for every player. The engine layer writes `enhnative.log` next to the game's own `Game.log` in `Documents\Shrek 2`, a new one at every start.
 
+Lifts and moving platforms start only when every player stands on them (the one who came first waits, at most 90 s), as the cutscene triggers already wait until everybody has passed. A guest's camera follows the level's camera triggers (tunnels, narrow rooms) and the size of his own hero (Mongo's camera stands far back), as the host's does. A guest can move along vines and climb up onto ledges: his keys reach his hero while it hangs.
+
 Status: beta. It is tested with scripted bots and a second game window; play over the Internet between real people has had little testing.
 
 This repository holds **sources only**. It does not contain game files, textures, audio, the HD pack, the Level Editor, the Shrek title font, or any compiled binary. The game's own packages are never modified except as described under "What the setup changes".
@@ -16,7 +18,7 @@ This repository holds **sources only**. It does not contain game files, textures
 
 | Folder | What it is |
 |---|---|
-| `mod/Enhanced/Classes` | UnrealScript of the mod (`Enhanced.u`): game class, menus, lobby, saves, HUD, animation sync, UPnP |
+| `mod/Enhanced/Classes` | UnrealScript of the mod (`Enhanced.u`): game class, menus, lobby, saves, HUD, animation sync, UPnP; also the play-test bot (`EnhancedPlayBot`, `EnhancedNav`: a walkable map of the level made from the engine's traces, A*, jumps, lily pads, bounce pads, vines, climbs), which does nothing unless a test sets the `SHREK2_BOT` environment variable |
 | `mod/IpDrv/Classes` | the sockets package the mod's UPnP and LAN code uses (`IpDrv.u`) |
 | `mod/Localization` | `Enhanced.int` and `Enhanced.Rus` (UTF-16): mod texts and the speaker table |
 | `mod/Obs/Classes` | a test-only mutator that measures the stock game's jump; not shipped |

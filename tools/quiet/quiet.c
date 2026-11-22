@@ -3,7 +3,10 @@
  *  - game windows are created without activation (WS_EX_NOACTIVATE) and, when SHREK2_POS="x,y" is set, on that spot
  *    (the second monitor), so a test window is visible but never gets the keyboard or the mouse;
  *  - the game is told that it is the foreground window anyway, so it does not go to sleep (UE2 sleeps when inactive);
- *  - the game cannot move, clip or capture the mouse cursor.
+ *  - the game cannot move, clip or capture the mouse cursor;
+ *  - the game window never hears that it lost the focus (WM_KILLFOCUS, WM_ACTIVATE inactive, WM_ACTIVATEAPP false): the stock game pauses itself
+ *    then (OnGameMinimize -> SetPause True) and a test window never gets the focus back (play run n1, 2026-11-22: the guest's menu book never
+ *    opened, the game stood paused at 140 fps).
  * The hooks are 5-byte hot patches in user32, the same for every module of the process. Log: quiet.log next to Game.exe. */
 #include <windows.h>
 #define DIRECTINPUT_VERSION 0x0800
@@ -170,18 +173,56 @@ static HWND gamewin(void)
 
 static int posx = CW_USEDEFAULT, posy = CW_USEDEFAULT, haspos;
 
+/* ---- focus loss is not passed on to the game's windows ---- */
+#define NSUB 16
+static HWND subw[NSUB];
+static WNDPROC subp[NSUB];
+static int nsub, swallowed;
+static LRESULT CALLBACK quiet_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+	int i;
+	WNDPROC o = NULL;
+	for (i = 0; i < nsub; i++) if (subw[i] == h) { o = subp[i]; break; }
+	if ((m == WM_KILLFOCUS) || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) || (m == WM_ACTIVATEAPP && w == FALSE)) {
+		if (swallowed++ < 20) {
+			char t[64];
+			sprintf(t, "0x%04X", m);
+			L("focus loss not passed on to the game: message %s", t);
+		}
+		return 0;
+	}
+	if (!o) return IsWindowUnicode(h) ? DefWindowProcW(h, m, w, l) : DefWindowProcA(h, m, w, l);
+	return IsWindowUnicode(h) ? CallWindowProcW(o, h, m, w, l) : CallWindowProcA(o, h, m, w, l);
+}
+static void quiet_subclass(HWND h)
+{
+	if (!h || nsub >= NSUB) return;
+	subw[nsub] = h;
+	if (IsWindowUnicode(h)) subp[nsub] = (WNDPROC)SetWindowLongW(h, GWL_WNDPROC, (LONG)quiet_wndproc);
+	else subp[nsub] = (WNDPROC)SetWindowLongA(h, GWL_WNDPROC, (LONG)quiet_wndproc);
+	if (subp[nsub]) nsub++;
+}
+
 /* ---- the hooks ---- */
 static HWND (WINAPI *o_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 static HWND (WINAPI *o_CreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR c, LPCSTR n, DWORD st, int x, int y, int w, int h, HWND par, HMENU m, HINSTANCE i, LPVOID p)
 {
-	if (!par && !(st & WS_CHILD)) { ex |= WS_EX_NOACTIVATE; if (haspos) { x = posx; y = posy; } }
-	return o_CreateWindowExA(ex, c, n, st, x, y, w, h, par, m, i, p);
+	HWND r;
+	int top = !par && !(st & WS_CHILD);
+	if (top) { ex |= WS_EX_NOACTIVATE; if (haspos) { x = posx; y = posy; } }
+	r = o_CreateWindowExA(ex, c, n, st, x, y, w, h, par, m, i, p);
+	if (top) quiet_subclass(r);
+	return r;
 }
 static HWND WINAPI h_CreateWindowExW(DWORD ex, LPCWSTR c, LPCWSTR n, DWORD st, int x, int y, int w, int h, HWND par, HMENU m, HINSTANCE i, LPVOID p)
 {
-	if (!par && !(st & WS_CHILD)) { ex |= WS_EX_NOACTIVATE; if (haspos) { x = posx; y = posy; } }
-	return o_CreateWindowExW(ex, c, n, st, x, y, w, h, par, m, i, p);
+	HWND r;
+	int top = !par && !(st & WS_CHILD);
+	if (top) { ex |= WS_EX_NOACTIVATE; if (haspos) { x = posx; y = posy; } }
+	r = o_CreateWindowExW(ex, c, n, st, x, y, w, h, par, m, i, p);
+	if (top) quiet_subclass(r);
+	return r;
 }
 static HWND WINAPI h_GetForegroundWindow(void) { HWND g = gamewin(); return g ? g : NULL; }
 static HWND WINAPI h_GetFocus(void) { return gamewin(); }

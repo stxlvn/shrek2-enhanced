@@ -59,6 +59,7 @@ event Tick(float DeltaTime)
 			G.SyncSubs();
 		}
 		G.GateTick(DeltaTime);
+		G.LiftTick(DeltaTime);
 		G.HostCameraWatch();
 		G.GateTestTick(DeltaTime);
 		G.ShowHostNote();

@@ -17,6 +17,10 @@ var float LogicalDesired;          // the angle the game wants; FovAngle holds t
 var bool bFovScaled;
 var bool bMenuCleaned;   // the menu pages of the previous level were closed
 var float MenuClock;   // tests only: see RunMenuScript
+var float MenuNextAt;  // tests only: when the next menu step is due
+var EnhancedPlayBot PlayBot;   // the play test (EnhancedPlayBot): this controller's hero is driven by the bot
+var bool bPlayBotChecked;
+var int PosterFrames;          // frames the wanted poster's picture is up (the bot clicks it away)
 var int MenuStep;
 var Tab_Options FixedPage;     // the stock Settings page whose video tab has been rearranged (see FixSettingsPage)
 var bool bAASet, bAFSet;
@@ -231,10 +235,13 @@ function RunMenuScript(GUIController GC)
 	{
 		return;
 	}
-	if (MenuClock < 12.0 + 5.0 * float(MenuStep))
+	// one step every five seconds after the first twelve; "untilguest" waits for a guest in the lobby; a step ending in "+" is pressed again every five
+	// seconds while the page it is for is open (Start until everybody is ready)
+	if (MenuClock < FMax(12.0, MenuNextAt) || !G.IsMenuLevel())
 	{
 		return;
 	}
+	MenuNextAt = MenuClock + 5.0;
 	S = G.MenuScript;
 	for (i = 0; i < MenuStep; i++)
 	{
@@ -253,7 +260,26 @@ function RunMenuScript(GUIController GC)
 		Step = S;
 	}
 	MenuStep++;
-	Log("[SDBG] menu test: step " $ string(MenuStep) $ " '" $ Step $ "' on " $ string(GC.ActivePage.Class));
+	if (Step ~= "untilguest")
+	{
+		// a guest in the lobby logs in as a spectator: NumPlayers does not count him (play run p11); the mod's list of guests does
+		if (G.GPC.Length < 1)
+		{
+			MenuStep--;
+		}
+		else
+		{
+			Log("[SDBG] menu test: a guest is in the lobby");
+		}
+		return;
+	}
+	if (Right(Step, 1) == "+")
+	{
+		Step = Left(Step, Len(Step) - 1);
+		MenuStep--;
+	}
+	Log("[SDBG] menu test: step " $ string(MenuStep + 1) $ " '" $ Step $ "' on " $ string(GC.ActivePage.Class));
+	G.EnhLog("[PLAY] menu step " $ string(MenuStep + 1) $ " '" $ Step $ "' on " $ string(GC.ActivePage.Class));
 	if (Tab_Options(GC.ActivePage) != None)
 	{
 		// the stock Settings page: Step is the tab to show (game, video, sound), or "drop<list>" opens a drop-down list (res, aa, af, tex, obj)
@@ -522,11 +548,120 @@ function PressPauseMenu(string What)
 	}
 }
 
+// The play test (EnhancedPlayBot): why the controls are not the player's now ("" = they are).
+function string BotBusy()
+{
+	// Health is a float in the game's Pawn and an int in the classes the mod compiles against: reading Pawn.Health from the mod's script crashed
+	// the script engine (tests b1-b3); the value is read by name
+	if (Pawn == None || float(Pawn.GetPropertyText("Health")) <= 0.0)
+	{
+		return "no hero";
+	}
+	if (Player != None && GUIController(Player.GUIController) != None && GUIController(Player.GUIController).ActivePage != None)
+	{
+		// the wanted poster's full-screen picture (the game is paused under it): a player clicks it away, the bot does after a moment (frames are
+		// counted: the level's clock stands still while it is paused)
+		if (PlayBot != None && GUIController(Player.GUIController).ActivePage.IsA('SHInGameWantedPoster'))
+		{
+			PosterFrames++;
+			if (PosterFrames == 150)
+			{
+				Log("[PLAY] host: the wanted poster's picture is clicked away");
+				EnhancedGame(Level.Game).EnhLog("[PLAY] " $ string(Level) $ " host: the wanted poster's picture is clicked away");
+				SHInGameWantedPoster(GUIController(Player.GUIController).ActivePage).InternalOnClick(SHInGameWantedPoster(GUIController(Player.GUIController).ActivePage).PosterBtn);
+			}
+			return "the wanted poster is shown";
+		}
+		return "a menu is open";
+	}
+	PosterFrames = 0;
+	if (Level.Pauser != None)
+	{
+		return "paused";
+	}
+	// (the mod's gate hold, GateNoteHost, is handled by the bot itself: it stands on the gate's trigger, EnhancedPlayBot.AtGate)
+	if (IsInState('PlayerWalking') || IsInState('PlayerSwimming') || IsInState('PlayerClimbing'))
+	{
+		return "";
+	}
+	return "controller state " $ string(GetStateName());
+}
+
+// The bot's choices for this frame, given as the keyboard gives them: the view's direction, forward, jump, attack.
+function PlayBotTick(float DeltaTime)
+{
+	local Rotator R;
+	local int BasisYaw;
+	local float A;
+
+	if (!bPlayBotChecked)
+	{
+		bPlayBotChecked = true;
+		if (Player != None && Viewport(Player) != None && InStr(EnhancedGame(Level.Game).EnhBotEnv(0), "play=1") >= 0)
+		{
+			PlayBot = new Class'Enhanced.EnhancedPlayBot';
+			PlayBot.Init(true);
+			Log("[PLAY] host: the play bot drives this hero on " $ string(Level));
+		}
+	}
+	// only on a level that is played, with a real hero (not the menu, not the logos' map SH2_Preamble with its stand-in DummyPlayer: the bot started there
+	// and the game ended in this controller's PlayerTick, test p10)
+	// nor in a guest's own opening (a single-player game of his until he joins the host: the bot took it for the host's game, play run p12)
+	if (PlayBot == None || EnhancedGame(Level.Game) == None || EnhancedGame(Level.Game).IsMenuLevel() || Left(string(Level), 12) ~= "SH2_Preamble"
+		|| EnhancedGame(Level.Game).IntroOnlyHost != ""
+		|| Pawn == None || !Pawn.IsA('ShHeroPawn') || Pawn.IsA('DummyPlayer'))
+	{
+		return;
+	}
+	PlayBot.Drive(self, DeltaTime, BotBusy());
+	if (PlayBot.bOutTurn)
+	{
+		R = Rotation;
+		R.Yaw = PlayBot.OutYaw;
+		SetRotation(R);
+	}
+	// the hero walks along the camera's axes (KWHeroController.GetRotationForPawnMove, bUseCameraAxesForPawnMove): the bot presses the forward and
+	// sideways keys for the way it wants relative to the camera, as a player does (turning the controller moved nothing: the hero kept walking the
+	// camera's way and ran into a rock, nav4)
+	if (Pawn.IsInState('MountHanging'))
+	{
+		// hanging: sideways moves along a vine, forward climbs up, back lets go (ShPlayerInput)
+		aStrafe = 1200.0 * PlayBot.OutHangX;
+		aBaseY = 1200.0 * PlayBot.OutHangY;
+	}
+	else if (PlayBot.OutForward > 0.0)
+	{
+		if (bUseCameraAxesForPawnMove)
+		{
+			BasisYaw = rCameraRot().Yaw;
+		}
+		else
+		{
+			BasisYaw = Pawn.Rotation.Yaw;
+		}
+		A = float((PlayBot.OutYaw - BasisYaw) & 65535) * 0.0000958738;
+		aBaseY = 1200.0 * PlayBot.OutForward * Cos(A);
+		aStrafe = 1200.0 * PlayBot.OutForward * Sin(A);
+	}
+	if (PlayBot.bOutJump)
+	{
+		bPressedJump = true;
+	}
+	if (PlayBot.bOutFire)
+	{
+		Fire(0);
+	}
+}
+
 event PlayerTick(float DeltaTime)
 {
 	local GUIController GC;
 
 	Class'Enhanced.EnhancedMenuFit'.static.Ensure(self);
+	if (EnhancedGame(Level.Game) != None)
+	{
+		PlayBotTick(DeltaTime);
+	}
 
 	if (!bHostMenuDone && EnhancedGame(Level.Game) != None && EnhancedGame(Level.Game).HostMenuAt > 0.0 && Level.TimeSeconds > EnhancedGame(Level.Game).HostMenuAt && Pawn != None)
 	{

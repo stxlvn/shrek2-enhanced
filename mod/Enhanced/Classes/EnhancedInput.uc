@@ -7,9 +7,28 @@ class EnhancedInput extends PlayerInput within EnhancedPlayerController
 // This is the stock PlayerInput with the game's own choices: the mouse always looks, the arrow keys turn and walk.
 event PlayerInput(float DeltaTime)
 {
-	local float FOVScale, MouseScale;
+	local float FOVScale, MouseScale, ShimRight, ShimUp;
 
 	Outer.BotInput(DeltaTime);
+	// the hanging keys go to the server, which runs this hero's hanging (see EnhancedPlayerController.ShimmyKeys); arrow keys first, as the stock
+	// ShPlayerInput reads them
+	if (Outer.aArrowRight != 0)
+	{
+		ShimRight = Outer.aArrowRight;
+	}
+	else
+	{
+		ShimRight = Outer.aStrafe;
+	}
+	if (Outer.aArrowUp != 0)
+	{
+		ShimUp = Outer.aArrowUp;
+	}
+	else
+	{
+		ShimUp = Outer.aBaseY;
+	}
+	Outer.ShimmyKeys(ShimRight, ShimUp);
 	bEdgeForward = bWasForward ^^ (Outer.aBaseY > 0);
 	bEdgeBack = bWasBack ^^ (Outer.aBaseY < 0);
 	bEdgeLeft = bWasLeft ^^ (Outer.aStrafe < 0);

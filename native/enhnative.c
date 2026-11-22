@@ -1249,6 +1249,25 @@ static void __attribute__((thiscall)) hook_RdPresent(void *self, void *vp)
 	orig_RdPresent(self, vp);
 }
 
+/* UD3DRenderDevice::RenderMovie draws the frame of a Bink movie (the logos at the start, the story movies). In a game window that is not the active
+ * window it read a freed or never filled frame buffer and ended the game (D3DDrv.dll+0x24418, reading 005C0073, every play test p2-p7 with two test
+ * windows that are never activated). While the game's window is not the active one the movie's frame is not drawn; the movie itself goes on. */
+typedef void (__attribute__((thiscall)) *RenderMovieFn)(void *, void *);
+static RenderMovieFn orig_RenderMovie;
+static void __attribute__((thiscall)) hook_RenderMovie(void *self, void *vp)
+{
+	static int said;
+	HWND fg = GetForegroundWindow();
+	if (g_devWnd && (!fg || GetAncestor(fg, GA_ROOT) != GetAncestor(g_devWnd, GA_ROOT))) {
+		if (said < 2) {
+			said++;
+			enh_log("movie: a frame is not drawn while the game's window is not the active one");
+		}
+		return;
+	}
+	orig_RenderMovie(self, vp);
+}
+
 /* UD3DRenderDevice::SetRes(viewport, x, y, full screen, color bytes, save size): logged, with its result (the engine calls it again when the window comes
  * back from Alt+Tab). */
 typedef int (__attribute__((thiscall)) *SetResFn)(void *, void *, int, int, int, int, int);
@@ -1567,6 +1586,7 @@ void *__stdcall Direct3DCreate8(UINT version)
 		if (!real_is_dxvk() && hook_thunk("D3DDrv.dll", "?ReadPixels@UD3DRenderDevice@@UAEXPAVUViewport@@PAVFColor@@@Z", (void *)hook_ReadPixels, (void **)&orig_ReadPixels))
 			g_readPixelsHooked = 1;
 		hook_thunk("D3DDrv.dll", "?SetRes@UD3DRenderDevice@@UAEHPAVUViewport@@HHHHH@Z", (void *)hook_SetRes, (void **)&orig_SetRes);
+		hook_thunk("D3DDrv.dll", "?RenderMovie@UD3DRenderDevice@@UAEXPAVUViewport@@@Z", (void *)hook_RenderMovie, (void **)&orig_RenderMovie);
 		hook_thunk("D3DDrv.dll", "?Lock@UD3DRenderDevice@@UAEPAVFRenderInterface@@PAVUViewport@@PAEPAH@Z", (void *)hook_RdLock, (void **)&orig_RdLock);
 		hook_thunk("D3DDrv.dll", "?Present@UD3DRenderDevice@@UAEXPAVUViewport@@@Z", (void *)hook_RdPresent, (void **)&orig_RdPresent);
 		hook_thunk("WinDrv.dll", "?Repaint@UWindowsViewport@@UAEXH@Z", (void *)hook_VpRepaint, (void **)&orig_VpRepaint);
@@ -2457,19 +2477,27 @@ static void __attribute__((thiscall)) nat_stopallmusic(void *self, FFrame *stack
  * UGameEngine::LoadMap: the loading screen (PaintProgress) draws the old network level once more, and its terrain can no longer read its data
  * (General protection fault in ATerrainInfo::UpdateVertices <- CheckComputeDataOnLoad <- ... <- PaintProgress <- LoadingScreen <- LoadMap <- LocalMapURL).
  * While this machine is a network client (3542 EnhNetClient(1), called every frame by the guest's controller; it lapses after 10 s) the loading
- * screen is not drawn: the last picture stays until the new level is there. */
+ * screen is not drawn: the last picture stays until the new level is there.
+ * The flag's time is kept apart from the flag: it was stored as GetTickCount() | 1, and a draw in the same tick as the call (the guest's own
+ * opening trip starts in the frame that sets it) gave now - (now | 1) = 0xFFFFFFFF for an even tick: "lapsed", drawn, crashed (test r2). */
 typedef void (__attribute__((thiscall)) *VoidThisFn)(void *);
 static VoidThisFn orig_PaintProgress;
-static volatile DWORD g_netClientTick;
+static volatile int g_netClientOn;
+static volatile DWORD g_netClientTime;
 static unsigned g_paintSkips;
+
+static unsigned g_paintDraws;
 
 static void __attribute__((thiscall)) hook_PaintProgress(void *self)
 {
-	if (g_netClientTick && GetTickCount() - g_netClientTick < 10000) {
+	if (g_netClientOn && (DWORD)(GetTickCount() - g_netClientTime) < 10000) {
 		if (g_paintSkips++ < 3)
 			enh_log("loading screen of a network client not drawn (the old level's terrain would crash it)");
 		return;
 	}
+	/* the draws are logged too (a few), so a test can tell "drawn while a network client" (the crash's way) from "never asked to draw" */
+	if (g_paintDraws++ < 5)
+		enh_log("loading screen drawn (network client flag %s)", g_netClientOn ? "lapsed" : "off");
 	orig_PaintProgress(self);
 }
 
@@ -2479,7 +2507,8 @@ static void __attribute__((thiscall)) nat_netclient(void *self, FFrame *stack, v
 	(void)self; (void)result;
 	fn_Step(stack, stack->object, &on);
 	stack->code++;
-	g_netClientTick = on ? (GetTickCount() | 1) : 0;
+	g_netClientTime = GetTickCount();
+	g_netClientOn = on != 0;
 }
 
 /* ---- 3543 EnhListen() -> "" or the engine's error: the level that is loaded now becomes a listen server --------------------------------
@@ -2531,6 +2560,61 @@ static void __attribute__((thiscall)) nat_listen(void *self, FFrame *stack, void
 	((unsigned short **)result)[0] = w;
 	((int *)result)[1] = n + 1;
 	((int *)result)[2] = n + 1;
+}
+
+/* ---- 3545 EnhBotEnv(int Once) -> string: the play test's script (environment variable SHREK2_BOT) ----------------------------------------------
+ * A test game is started like a player's (Game.exe and nothing else) and is played by the mod's bot; what the bot does comes from SHREK2_BOT, e.g.
+ * "menu=coop;nick=Alice;host;create;untilguest;main+|play=1". Once = 1 hands the text out once per process (the menu part is played only in the first
+ * menu, not after a return to it); Once = 0 always. Not set: an empty string (a player's game). */
+static int g_botEnvGiven;
+static void __attribute__((thiscall)) nat_botenv(void *self, FFrame *stack, void *result)
+{
+	char v[1024];
+	int once = 0, n, i;
+	DWORD k;
+	unsigned short *w;
+	(void)self;
+	fn_Step(stack, stack->object, &once);
+	stack->code++;
+	((unsigned short **)result)[0] = NULL;
+	((int *)result)[1] = 0;
+	((int *)result)[2] = 0;
+	k = GetEnvironmentVariableA("SHREK2_BOT", v, sizeof v);
+	if (k == 0 || k >= sizeof v)
+		return;
+	if (once) {
+		if (g_botEnvGiven)
+			return;
+		g_botEnvGiven = 1;
+	}
+	n = (int)k;
+	if (!(w = (unsigned short *)eng_malloc((unsigned long)(n + 1) * 2)))
+		return;
+	for (i = 0; i <= n; i++)
+		w[i] = (unsigned char)v[i];
+	((unsigned short **)result)[0] = w;
+	((int *)result)[1] = n + 1;
+	((int *)result)[2] = n + 1;
+}
+
+/* ---- 3546 EnhLog(string S): a line of the play test into enhnative.log ----------------------------------------------------------------------
+ * Game.log is written through a buffer (its last part is lost when a test copy is closed or killed, and it cannot be followed while the game runs;
+ * calling the engine log's Flush from the layer crashed the game). The play bot's lines and the menu steps go to enhnative.log as well, which is written
+ * at once. Characters outside ASCII become '?'. */
+static void __attribute__((thiscall)) nat_log(void *self, FFrame *stack, void *result)
+{
+	struct { unsigned short *data; int num, max; } t = { NULL, 0, 0 };
+	char line[600];
+	int i, n = 0;
+	(void)self;
+	(void)result;
+	fn_Step(stack, stack->object, &t);
+	stack->code++;
+	for (i = 0; t.data && i < t.num && t.data[i] && n < (int)sizeof line - 1; i++)
+		line[n++] = (char)(t.data[i] < 128 ? t.data[i] : '?');
+	line[n] = 0;
+	enh_log("%s", line);
+	eng_free(t.data);
 }
 
 /* ---- 3544 EnhTextWidth(Canvas C, GUIStyles Style, string Text) -> pixels: how wide a menu style draws a text ----------------------------------
@@ -2797,6 +2881,8 @@ static void native_init(void)
 	register_native(table, 3542, nat_netclient, undef);
 	register_native(table, 3543, nat_listen, undef);
 	register_native(table, 3544, nat_textwidth, undef);
+	register_native(table, 3545, nat_botenv, undef);
+	register_native(table, 3546, nat_log, undef);
 	register_native(table, 3536, nat_musicwatch, undef);
 	register_native(table, 3537, nat_musicpoll, undef);
 	register_native(table, 3538, nat_playmusic, undef);
@@ -2825,6 +2911,62 @@ static void native_init(void)
 	}
 }
 
+/* ---- Where a crash happened -------------------------------------------------------------------------------------------------------------
+ * The engine's crash report names only its guard blocks ("UGameEngine::Draw") and not the place. A vectored handler logs every access violation (the
+ * first ten of a process) with its module and offset and the registers, before the engine's own handlers see it; it changes nothing. */
+static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *e)
+{
+	static LONG n;
+	MEMORY_BASIC_INFORMATION mbi;
+	char mod[MAX_PATH] = "?";
+	DWORD code = e->ExceptionRecord->ExceptionCode;
+	void *at = e->ExceptionRecord->ExceptionAddress;
+	unsigned char *base = NULL;
+	if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO)
+		return EXCEPTION_CONTINUE_SEARCH;
+	if (InterlockedIncrement(&n) > 10)
+		return EXCEPTION_CONTINUE_SEARCH;
+	if (VirtualQuery(at, &mbi, sizeof mbi)) {
+		base = (unsigned char *)mbi.AllocationBase;
+		if (!GetModuleFileNameA((HMODULE)base, mod, sizeof mod))
+			strcpy(mod, "?");
+	}
+	enh_log("EXCEPTION 0x%08lx at %p = %s+0x%lx, %s %p; eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx esp %08lx ebp %08lx, thread %lu",
+		(unsigned long)code, at, strrchr(mod, '\\') ? strrchr(mod, '\\') + 1 : mod, (unsigned long)((unsigned char *)at - base),
+		e->ExceptionRecord->NumberParameters >= 2 && e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+		e->ExceptionRecord->NumberParameters >= 2 ? (void *)e->ExceptionRecord->ExceptionInformation[1] : NULL,
+		(unsigned long)e->ContextRecord->Eax, (unsigned long)e->ContextRecord->Ebx, (unsigned long)e->ContextRecord->Ecx, (unsigned long)e->ContextRecord->Edx,
+		(unsigned long)e->ContextRecord->Esi, (unsigned long)e->ContextRecord->Edi, (unsigned long)e->ContextRecord->Esp, (unsigned long)e->ContextRecord->Ebp,
+		(unsigned long)GetCurrentThreadId());
+	{
+		/* the return addresses on the stack that fall into a module: a rough call chain */
+		DWORD *sp = (DWORD *)e->ContextRecord->Esp;
+		int i, k = 0;
+		char chain[700];
+		size_t len = 0;
+		chain[0] = 0;
+		for (i = 0; i < 256 && k < 14; i++) {
+			MEMORY_BASIC_INFORMATION m2;
+			char m[MAX_PATH];
+			DWORD v;
+			if (IsBadReadPtr(sp + i, 4))
+				break;
+			v = sp[i];
+			if (v < 0x10000 || !VirtualQuery((void *)v, &m2, sizeof m2) || !(m2.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+				continue;
+			if (!GetModuleFileNameA((HMODULE)m2.AllocationBase, m, sizeof m))
+				continue;
+			len += (size_t)snprintf(chain + len, sizeof chain - len, " %s+0x%lx", strrchr(m, '\\') ? strrchr(m, '\\') + 1 : m,
+				(unsigned long)(v - (DWORD)m2.AllocationBase));
+			k++;
+			if (len >= sizeof chain - 40)
+				break;
+		}
+		enh_log("EXCEPTION stack:%s", chain);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
 	(void)inst; (void)reserved;
@@ -2832,6 +2974,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 		HMODULE k32 = GetModuleHandleA("kernel32.dll");
 		InitializeCriticalSection(&g_logLock);
 		g_logLockReady = 1;
+		AddVectoredExceptionHandler(1, crash_veh);
 		g_inDllMain = 1;
 		real_GetProcAddress = (void *)GetProcAddress(k32, "GetProcAddress");
 		real_CreateMutexA = (void *)GetProcAddress(k32, "CreateMutexA");

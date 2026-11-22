@@ -5,8 +5,12 @@ var string TravelHost;    // the host's address while the level is being changed
 var int TravelTries;
 var string LastView;
 var float BotJumpHold;
+var Vector ClimbPhysLoc;      // where the hero was when that began: a hero that moves is flying (a lily pad's or a bounce pad's throw), not stuck
 var float ClimbPhysSince;   // client: since when his hero has the climbing physics without climbing (see ClientClimbWatch)
 var float ClimbStuckSince;  // server: when the server's copy of this guest's hero went into a climb; client: when his own hero did (0 = not climbing)
+var EnhancedPlayBot PlayBot;   // the play test (EnhancedPlayBot): this guest's hero is driven by the bot
+var bool bPlayBotChecked, bPlayBotOn;
+var float RoomSince;           // the play test: how long the lobby's room page has been open (Ready is pressed after three seconds)
 var float ClimbTestT;      // tests (EnhClimbTest): seconds since the host put this guest in front of the swamp's stump; the bot walks into it and jumps
 var float ClimbLogClock;
 var config bool bTestBot;   // tests only: the client plays a fixed script of inputs (set in the test profile's User.ini)
@@ -86,6 +90,22 @@ var bool bNickSent;            // the nickname of the lobby settings was sent to
 var float NickClock;
 var input float aArrowRight;   // the game binds the arrow keys to these two axes (see EnhancedInput)
 var input float aArrowUp;
+var float ShimR, ShimU;         // guest: the hanging keys' directions last sent to the server (ShimmyKeys)
+var bool bHangSrv;              // the server's copy of this guest's hero hangs (a vine, a ledge); his own machine never runs that state
+var bool bCamTrig;              // a camera trigger of the level holds this guest's camera (ClientCamTrigger); off = the usual chase camera
+var float CamTrigDist, CamTrigMinP, CamTrigMaxP;
+var Vector CamTrigOff;
+var Actor SrvCamTrig;           // server: the camera trigger this guest's hero stands in (EnhancedGame.GuestCamTick)
+var float CamShotAt;            // tests only (SHREK2_BOT camshot=1): the game's own shot of this guest's picture after a camera change
+var Pawn CamStdFor;             // the hero whose own camera values (CameraSetStandard) are read into CamStdDist/CamStdOff
+var float AnimOffSince;         // since when this guest's hero has had its movement animation off outside a climb (AnimWatch; per machine)
+var float ShotEvery, ShotNext;  // tests only (SHREK2_BOT shotevery=N): the game's own shot of this guest's picture every N seconds
+var bool bShotEveryRead;
+var int AnimFixes;
+var float CamStdDist;
+var Vector CamStdOff;
+var Pawn ShimPawn;
+var int ShimLogs;
 
 // ---- The guest's own cutscene (see StartLocalCut) ----
 var EnhancedLocalCut LocalCut;   // client: the cutscene playing on this machine
@@ -153,6 +173,8 @@ event PlayerCalcView(out Actor ViewActor, out Vector CameraLocation, out Rotator
 	local float Want, D, Dt, K;
 	local int DY, DP, DR;
 	local Actor A;
+	local Vector Off;
+	local Rotator PY;
 
 	if (bMenuHold)
 	{
@@ -259,7 +281,37 @@ event PlayerCalcView(out Actor ViewActor, out Vector CameraLocation, out Rotator
 		{
 			Dt = 0.016;
 		}
-		Eye = Pawn.Location + vect(0.0, 0.0, 75.0);
+		// the hero's own camera values, as the stock camera takes them (BaseCam.InitTarget: CameraSetStandard; the look-at point is the hero's
+		// place plus vLookAtOffset turned with the hero, the camera fLookAtDistance behind it). A fixed Shrek-sized camera sat inside Mongo
+		// (owner's screenshot, Castle Siege: radius 150, height 300, the stock camera 600 back) and too far from Puss and Donkey.
+		ReadCamStd();
+		Off = CamStdOff;
+		Want = CamStdDist;
+		if (bCamTrig)
+		{
+			// a camera trigger's values (ClientCamTrigger) instead, the pitch in its limits
+			Off = CamTrigOff;
+			Want = CamTrigDist;
+			DP = CameraRotation.Pitch & 65535;
+			if (DP > 32768)
+			{
+				DP -= 65536;
+			}
+			if (float(DP) < CamTrigMinP)
+			{
+				DP = int(CamTrigMinP);
+			}
+			if (float(DP) > CamTrigMaxP)
+			{
+				DP = int(CamTrigMaxP);
+			}
+			CameraRotation.Pitch = DP & 65535;
+			MyView.Pitch = CameraRotation.Pitch;
+		}
+		PY.Yaw = Pawn.Rotation.Yaw;
+		Eye = Off;
+		Eye.Z = 0.0;
+		Eye = Pawn.Location + (Eye >> PY) + vect(0.0, 0.0, 1.0) * Off.Z;
 		if (!bEyeInit || VSize(Eye - EyeSm) > 250.0)
 		{
 			EyeSm = Eye;
@@ -271,7 +323,6 @@ event PlayerCalcView(out Actor ViewActor, out Vector CameraLocation, out Rotator
 		}
 		Eye = EyeSm;
 		Dir = vect(0.0, 0.0, 0.0) - Vector(CameraRotation);
-		Want = 170.0;
 		foreach TraceActors(Class'Engine.Actor', A, HitLoc, HitNorm, Eye + Dir * (Want + 20.0), Eye, vect(0.0, 0.0, 0.0))
 		{
 			if (A == Pawn || A.IsA('Pawn') || A.IsA('Projectile'))
@@ -356,6 +407,10 @@ event PreClientTravel()
 		FinishLocalCut(false);
 	}
 	Super.PreClientTravel();
+	if (Level.NetMode == NM_Client)
+	{
+		EnhNetClient(1);     // the loading screen of this trip must not draw the network level (see ClientIntroFirst)
+	}
 	W = TravelWatch();
 	if (Level.NetMode == NM_Client && W == None && Player != None && Player.InteractionMaster != None)
 	{
@@ -373,17 +428,135 @@ event PreClientTravel()
 replication
 {
 	reliable if (Role == ROLE_Authority)
-		ClientCutCast, ClientLocalCut, ClientCutHostEnded, ClientMusic, ClientIntroFirst, ClientClimbTest, ClientEndClimb;
+		ClientCutCast, ClientLocalCut, ClientCutHostEnded, ClientMusic, ClientIntroFirst, ClientClimbTest, ClientEndClimb, ClientCamTrigger;
 	reliable if (Role < ROLE_Authority)
 		ServerLocalCutDone;
 	reliable if (Role == ROLE_Authority)
 		ClientCutView, GateNote, DownNote, LeashNote, WaitNote, HeroJump, HeroDoubleJump, SubText, SubName, SubColor, HudCoins, HudPotions, HudPotionSel, HudIcons, HudExtra;
 	reliable if (Role < ROLE_Authority)
-		ServerAction, ServerSetReady;
+		ServerAction, ServerSetReady, ServerBotHop, ServerShimmy;
 	unreliable if (Role == ROLE_Authority && bNetOwner)
 		CutLoc, CutYaw, CutPitch, CutRoll, CutFov;
+	reliable if (Role == ROLE_Authority && bNetOwner)
+		bHangSrv;
 	unreliable if (Role < ROLE_Authority)
 		ServerSetView;
+}
+
+// The level's camera triggers (KWGame.CameraTrigger: tunnels, narrow rooms) set "the" hero's camera, the host's (KWHeroController.Camera through
+// Level.PlayerHeroActor); a guest's chase camera never changed, and in a tunnel it hung outside the walls (owner's screenshot, 2026-11-22). The
+// server sees the guest's hero step into one and sends what the trigger sets (EnhancedGame.GuestCamTick), the same way the stock trigger does it:
+// Mode 0 = its non-zero values over the current ones, 1 = back to the usual camera.
+simulated function ClientCamTrigger(byte Mode, float Dist, Vector Off, float MinP, float MaxP, int SnapPitch)
+{
+	if (InStr(EnhBotEnv(0), "camshot=1") >= 0)
+	{
+		CamShotAt = Level.TimeSeconds + 2.5;
+	}
+	if (Mode == 1)
+	{
+		if (bCamTrig)
+		{
+			Log("[SDBG] camera: back to the usual chase camera");
+		}
+		bCamTrig = false;
+		return;
+	}
+	if (!bCamTrig)
+	{
+		// the usual chase camera's own values (the hero's CameraSetStandard, view pitch limits in PlayerMove) are what the trigger's zero fields keep
+		ReadCamStd();
+		CamTrigDist = CamStdDist;
+		CamTrigOff = CamStdOff;
+		CamTrigMinP = -14000.0;
+		CamTrigMaxP = 4500.0;
+	}
+	bCamTrig = true;
+	if (Dist != 0.0)
+	{
+		CamTrigDist = Dist;
+	}
+	if (Off != vect(0.0, 0.0, 0.0))
+	{
+		CamTrigOff = Off;
+	}
+	if (MinP != 0.0)
+	{
+		CamTrigMinP = MinP;
+	}
+	if (MaxP != 0.0)
+	{
+		CamTrigMaxP = MaxP;
+	}
+	if (SnapPitch != 0)
+	{
+		MyView.Pitch = SnapPitch & 65535;
+	}
+	Log("[SDBG] camera: a camera trigger of the level: distance " $ string(int(CamTrigDist)) $ ", look-at offset " $ string(CamTrigOff) $ ", pitch "
+		$ string(int(CamTrigMinP)) $ ".." $ string(int(CamTrigMaxP)) $ ", set pitch " $ string(SnapPitch));
+}
+
+// The T pose (the lead's friend, 2026-11-21, on both screens after the swamp's lily pads): a lily pad is a mount (AmbientLily MountAction 3).
+// KWPawn.Mounting.BeginState switches the hero's movement animation off (bPhysicsAnimUpdate, the only place in the game that does) and only
+// MountFinish or CancelMount switch it on again; a climb cut short in between (the climb watchdogs of that build dropped a hero on a lily pad
+// after 0.4 s) left it off for good: no walk, run or idle animation any more. On both the server (his hero there) and his own machine: a hero
+// that is not climbing nor hanging with it off for 1.5 s gets it back, logged with the state it was found in.
+simulated function bool AnimWatch(Pawn P, float DeltaTime, string Where)
+{
+	if (P == None || P.bPhysicsAnimUpdate || P.bHidden || InClimb(P) || P.IsInState('MountHanging'))
+	{
+		AnimOffSince = 0.0;
+		return false;
+	}
+	AnimOffSince += DeltaTime;
+	if (AnimOffSince < 1.5)
+	{
+		return false;
+	}
+	AnimOffSince = 0.0;
+	AnimFixes++;
+	Log("[SDBG] animation watch (" $ Where $ "): " $ string(P) $ " had its movement animation off outside a climb (state " $ string(P.GetStateName()) $ ", physics "
+		$ string(int(P.Physics)) $ ", anim " $ P.GetPropertyText("AnimSequence") $ "): switched on again, fix " $ string(AnimFixes));
+	P.bPhysicsAnimUpdate = true;
+	P.AnimBlendParams(1, 0.0);
+	return true;
+}
+
+// the hero's own camera values (KWPawn.CameraSetStandard: "(vLookAtOffset=(X=..,Y=..,Z=..),fLookAtDistance=..,..)"), read once per hero
+simulated function ReadCamStd()
+{
+	local string S, O;
+	local int i;
+
+	if (Pawn == None || Pawn == CamStdFor)
+	{
+		return;
+	}
+	CamStdFor = Pawn;
+	CamStdDist = 170.0;
+	CamStdOff = vect(0.0, 0.0, 75.0);
+	S = Pawn.GetPropertyText("CameraSetStandard");
+	i = InStr(S, "fLookAtDistance=");
+	if (i >= 0 && float(Mid(S, i + 16)) > 10.0)
+	{
+		CamStdDist = float(Mid(S, i + 16));
+	}
+	i = InStr(S, "vLookAtOffset=(");
+	if (i >= 0)
+	{
+		O = Mid(S, i + 15);
+		i = InStr(O, ")");
+		if (i > 0)
+		{
+			O = Left(O, i);
+			CamStdOff = Class'Enhanced.EnhancedGame'.static.PropVec("(" $ O $ ")");
+		}
+	}
+	Log("[SDBG] camera: " $ string(Pawn.Class.Name) $ "'s own camera: distance " $ string(int(CamStdDist)) $ ", look-at offset " $ string(CamStdOff));
+	if (InStr(EnhBotEnv(0), "camshot=1") >= 0)
+	{
+		CamShotAt = Level.TimeSeconds + 4.0;
+	}
 }
 
 simulated function ClientCutView(bool bOn)
@@ -412,6 +585,77 @@ function ServerSetView(int Yaw)
 {
 	ViewYawSrv = Yaw;
 	bViewSrv = true;
+}
+
+// The hero's moves while he hangs (KWPawn state MountHanging: along a vine, up onto a ledge, letting go) read ShimmyControlRight/Up on the machine
+// that runs the hero: for a guest's hero, the server. The stock game sets them on the player's own machine (ShPlayerInput, from the sideways and
+// forward keys), so a guest's keys never reached his hero: on a vine or a ledge he hung until something else moved him. The guest's input
+// (EnhancedInput) sends the keys' directions here when they change; the server's copy of his hero gets them. -1, 0 or 1 each.
+simulated function ShimmyKeys(float R, float U)
+{
+	if (R > 0.0)
+	{
+		R = 1.0;
+	}
+	else if (R < 0.0)
+	{
+		R = -1.0;
+	}
+	if (U > 0.0)
+	{
+		U = 1.0;
+	}
+	else if (U < 0.0)
+	{
+		U = -1.0;
+	}
+	if (Pawn == None || !Pawn.IsA('KWPawn'))
+	{
+		return;
+	}
+	if (R != ShimR || U != ShimU || Pawn != ShimPawn)
+	{
+		ShimR = R;
+		ShimU = U;
+		ShimPawn = Pawn;
+		ServerShimmy(R, U);
+	}
+}
+
+function ServerShimmy(float R, float U)
+{
+	if (Pawn == None || !Pawn.IsA('KWPawn'))
+	{
+		return;
+	}
+	Pawn.SetPropertyText("ShimmyControlRight", string(R));
+	Pawn.SetPropertyText("ShimmyControlUp", string(U));
+	if (Pawn.IsInState('MountHanging') && ShimLogs < 12)
+	{
+		ShimLogs++;
+		Log("[SDBG] guest hangs at " $ string(Pawn.Location) $ ": his keys sideways " $ string(int(R)) $ ", up " $ string(int(U)));
+	}
+}
+
+// play test only: the guest's bot is stuck behind (a vine or a gap it cannot take) and asks to be put near the host's hero. Honoured only when the
+// server itself runs the play test (its SHREK2_BOT has play=1), so a real game never moves anybody this way. The bot's limit, logged as HOP.
+function ServerBotHop(Vector L)
+{
+	local EnhancedGame G;
+
+	G = EnhancedGame(Level.Game);
+	if (G == None || Pawn == None || InStr(G.EnhBotEnv(0), "play=1") < 0)
+	{
+		return;
+	}
+	G.EnhLog("[PLAY] " $ G.MapName() $ " server: HOP (bot limit) of the guest's hero from " $ string(Pawn.Location) $ " to the host's hero at " $ string(L));
+	if (!Pawn.SetLocation(L + vect(0, 0, 60)))
+	{
+		Pawn.SetLocation(L + vect(0, 0, 120));
+	}
+	Pawn.Velocity = vect(0, 0, 0);
+	Pawn.SetPhysics(PHYS_Falling);
+	ClientSetLocation(Pawn.Location, Pawn.Rotation);
 }
 
 function ServerAction()
@@ -521,11 +765,14 @@ function ClientClimbWatch()
 	}
 	if (Pawn.Physics == PHYS_Projectile && !InClimb(Pawn) && !Pawn.IsInState('MountHanging'))
 	{
-		if (ClimbPhysSince == 0.0)
+		// the lily pads and bounce pads throw a hero with this physics too (night run n3: this watch dropped the guest 19 times from the swamp's
+		// lily pads, his jumps there rose 0): only a hero that stays put with it is stuck
+		if (ClimbPhysSince == 0.0 || VSize(Pawn.Location - ClimbPhysLoc) > 4.0)
 		{
 			ClimbPhysSince = Level.TimeSeconds;
+			ClimbPhysLoc = Pawn.Location;
 		}
-		else if (Level.TimeSeconds - ClimbPhysSince > 0.4)
+		else if (Level.TimeSeconds - ClimbPhysSince > 1.0)
 		{
 			Log("[SDBG] climb: my hero kept the climbing physics after the climb at " $ string(Pawn.Location) $ " (state " $ string(Pawn.GetStateName()) $ "): it falls again");
 			Pawn.Velocity = vect(0, 0, 0);
@@ -564,8 +811,112 @@ simulated function ClientClimbTest()
 	Log("[CLIMB] client: the climb test starts");
 }
 
+native(3545) final function string EnhBotEnv(int Once);
+native(3546) final function EnhLog(string S);
+
+// The play test: why the controls are not the player's now ("" = they are).
+function string BotBusy()
+{
+	// Health is a float in the game's Pawn and an int in the classes the mod compiles against: reading Pawn.Health from the mod's script crashed
+	// the script engine (tests b1-b3); the value is read by name
+	if (Pawn == None || float(Pawn.GetPropertyText("Health")) <= 0.0)
+	{
+		return "no hero";
+	}
+	if (Player != None && GUIController(Player.GUIController) != None && GUIController(Player.GUIController).ActivePage != None)
+	{
+		return "a menu is open";
+	}
+	if (Level.Pauser != None)
+	{
+		return "paused";
+	}
+	if (bLocalCut)
+	{
+		return "his own cutscene";
+	}
+	if (bCutView)
+	{
+		return "the host's cutscene";
+	}
+	if (!IsInState('PlayerWalking') && !IsInState('PlayerSwimming') && !IsInState('PlayerClimbing'))
+	{
+		return "controller state " $ string(GetStateName());
+	}
+	return "";
+}
+
+// The play test on a guest's machine: Ready in the lobby's room, then the hero driven by EnhancedPlayBot (only on the player's own machine).
+function PlayBotMenu(float DeltaTime)
+{
+	local GUIController GC;
+
+	if (!bPlayBotChecked)
+	{
+		bPlayBotChecked = true;
+		bPlayBotOn = Level.NetMode == NM_Client && InStr(EnhBotEnv(0), "play=1") >= 0;
+	}
+	if (!bPlayBotOn || Player == None)
+	{
+		return;
+	}
+	GC = GUIController(Player.GUIController);
+	if (GC != None && EnhancedRoomPage(GC.ActivePage) != None && !bLobbyReady)
+	{
+		RoomSince += DeltaTime;
+		if (RoomSince > 3.0)
+		{
+			RoomSince = 0.0;
+			Log("[PLAY] guest: Ready is pressed in the lobby");
+			EnhLog("[PLAY] guest: Ready is pressed in the lobby");
+			EnhancedRoomPage(GC.ActivePage).TestClick("main");
+		}
+	}
+	if (PlayBot == None && Pawn != None && Pawn.IsA('ShHeroPawn') && !Pawn.IsA('DummyPlayer') && !(Left(string(Level), 5) ~= "Book_") && !(Left(string(Level), 12) ~= "SH2_Preamble"))
+	{
+		PlayBot = new Class'Enhanced.EnhancedPlayBot';
+		PlayBot.Init(false);
+		Log("[PLAY] guest: the play bot drives this hero on " $ string(Level));
+	}
+}
+
 function BotInput(float DeltaTime)
 {
+	if (PlayBot != None && Pawn != None)
+	{
+		PlayBot.Drive(self, DeltaTime, BotBusy());
+		if (PlayBot.bOutTurn)
+		{
+			MyView.Yaw = PlayBot.OutYaw;
+			MyView.Pitch = 0;
+			bViewInit = true;
+		}
+		if (PlayBot.OutForward > 0.0)
+		{
+			aBaseY = 1200.0 * PlayBot.OutForward;
+		}
+		// while the hero hangs (a vine, a ledge): sideways keys move him along, forward climbs up, back lets go (ShPlayerInput reads aStrafe/aBaseY)
+		if (PlayBot.OutHangX != 0.0 || PlayBot.OutHangY != 0.0)
+		{
+			aStrafe = 1200.0 * PlayBot.OutHangX;
+			aBaseY = 1200.0 * PlayBot.OutHangY;
+		}
+		if (PlayBot.bOutJump)
+		{
+			bPressedJump = true;
+			BotJumpHold = 0.12;
+		}
+		if (BotJumpHold > 0.0)
+		{
+			BotJumpHold -= DeltaTime;
+			aUp = 1200.0;
+		}
+		if (PlayBot.bOutFire)
+		{
+			Fire(0);
+		}
+		return;
+	}
 	if (!bTestBot || Pawn == None)
 	{
 		return;
@@ -952,6 +1303,10 @@ simulated function ClientIntroFirst(string Map)
 	}
 	Addr = Level.GetAddressURL();
 	bIntroTravel = true;
+	// The host sends this as soon as the guest is in: the guest's PlayerTick may not have run on this level yet, so the engine layer does not know
+	// this is a network client and the loading screen of the trip below draws the network level once more. That level's terrain was never drawn
+	// and its data is gone by then: the engine crashed in ATerrainInfo::UpdateVertices (2 of ~20 direct joins in the night test 2026-11-22).
+	EnhNetClient(1);
 	Log("[SDBG] client: plays the opening of " $ Map $ " by himself, then joins " $ Addr);
 	Cur = string(Level);
 	if (InStr(Cur, ".") > 0)
@@ -1631,8 +1986,33 @@ event PlayerTick(float DeltaTime)
 	if (Level.NetMode == NM_Client)
 	{
 		EnhNetClient(1);
+		AnimWatch(Pawn, DeltaTime, "his own machine");
+		if (!bShotEveryRead)
+		{
+			bShotEveryRead = true;
+			S = EnhBotEnv(0);
+			if (InStr(S, "shotevery=") >= 0)
+			{
+				ShotEvery = float(Mid(S, InStr(S, "shotevery=") + 10));
+				ShotNext = Level.TimeSeconds + ShotEvery;
+			}
+		}
+		if (ShotEvery > 0.0 && Pawn != None && Level.TimeSeconds > ShotNext)
+		{
+			ShotNext = Level.TimeSeconds + ShotEvery;
+			Log("[SDBG] test shot every " $ string(int(ShotEvery)) $ " s: hero at " $ string(Pawn.Location) $ ", state " $ string(Pawn.GetStateName()) $ ", anim "
+				$ Pawn.GetPropertyText("AnimSequence") $ ", physics anim " $ string(Pawn.bPhysicsAnimUpdate));
+			ConsoleCommand("shot");
+		}
+		if (CamShotAt > 0.0 && Level.TimeSeconds > CamShotAt)
+		{
+			CamShotAt = 0.0;
+			Log("[SDBG] camera: test shot at " $ string(Pawn.Location) $ ", camera trigger " $ string(bCamTrig) $ ", distance " $ string(int(CamDist)));
+			ConsoleCommand("shot");
+		}
 		ClientHeroValues();
 		ClientClimbWatch();
+		PlayBotMenu(DeltaTime);
 	}
 	UndoHorPlus();
 	Super.PlayerTick(DeltaTime);

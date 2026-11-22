@@ -9,14 +9,41 @@ var bool bHostLoggedIn;
 // abilities are the same) is made only after the cutscenes, next to the host, and hidden while a cutscene runs.
 // Possess needs the network connection, which the engine attaches only after Login returns.
 var PlayerController PendingPC;
+// The lift gates: a lift or a moving platform carries only the players who stand on it, so it starts only when every player stands on it (the
+// lead's rule, 2026-11-22: "a trigger that moves the hero fires when both have stepped on it"). Kind 1: a touch trigger (Trigger, KWTrigger,
+// ElevatorTrigger) that stands on the mover its event moves; its own touch is off and LiftTick touches it for them. Kind 2: a mover that
+// starts when stood on (StandOpenTimed); it is switched to start on a trigger and LiftTick triggers it. Read on the first tick (LiftsRead).
+var array<Actor> LiftT;              // the trigger (kind 1) or the mover (kind 2)
+var array<byte> LiftKind;
+var array<Actor> LiftMover;
+var array<byte> LiftLatch;           // 1 = it went; it may go again only after everybody stepped off (repeatable lifts)
+var array<byte> LiftDone;            // 1 = a once-only trigger that went
+var array<float> LiftSince;          // when the first player stepped on (0 = nobody waits)
+var array<float> LiftWentAt;         // when it went (the log says 2 s later how far its mover has moved)
+var array<Vector> LiftWentFrom;
+var bool bLiftsRead, bLiftsHeld;     // read; their own triggering is held (only while a guest is in the game)
+var bool bLiftTestRead, bLiftTest;   // tests only (SHREK2_BOT lifttest=1): the host, then the guest are put on each lift in turn
+var int LiftTestAt, LiftTestPhase;
+var float LiftTestNext;
+var Vector LiftTestHostWas, LiftTestGuestWas;
+var float HangTickAt;
+var array<Actor> CamTrigs;           // the level's camera triggers (KWGame.CameraTrigger), read once (GuestCamTick)
+var bool bCamTrigsRead;
+var float CamTrigAt;
+var bool bCamTestRead, bCamTest;    // tests only (SHREK2_BOT camtest=1): the first guest's hero is put into each camera trigger in turn
+var int CamTestStep;
+var float CamTestNext;
 var array<PlayerController> GPC;      // the guests (see the section 'Guests')
 var array<KWPawn> GPawn;
-var array<bool> GHidden;
+var array<byte> GHidden;   // 1 = that guest's hero is hidden for the host's cutscene. Not array<bool>: the engine's dynamic arrays of bool lose what is
+                           // written into them (night play run h2: the hide was made again every heartbeat and never undone, after every host
+                           // cutscene the guest's hero stayed hidden, still and without collision)
 var array<float> GDead;
 var array<EnhancedCam> GCam;
 
 var KWPawn P2Pawn;
 var bool bP2Hidden;
+var int HideLogs;
 
 // Debug layer (see EnhancedDebug); spawned at game start.
 var EnhancedDebug Dbg;
@@ -110,6 +137,7 @@ var int DeathTestStep;
 var() config float EnemyHealthPerPlayer;   // 0.6: two players, enemies with 1.6 times the health
 var() config float EnemyDamagePerPlayer;   // 0.25: two players, hits that do 1.25 times the damage
 var int EnemiesLogged;
+var string BotText;                  // the play test's SHREK2_BOT text, if any (see EnhancedPlayBot)
 var string ShotTimes;                // URL option EnhShot=20,35: the game takes its own screenshot (tests; also for windows larger than the screen)
 var int ShotsTaken;
 var EnhancedWorldSync WorldSync[4];   // carries the level's own effects and creatures, which the engine never sends, to the clients (host only)
@@ -157,6 +185,7 @@ var float JitterClock;
 var bool bResListDone;               // the resolution list of the Settings page has been filled
 var float NoteTime;
 var string GateNoteHost;              // what the host's HUD shows while he waits at a gate
+var Vector GateWaitAt;                // the trigger of the gate the host waits at (the play test's host stands on it so his partner walks through it)
 var string LeashNoteHost;             // what the host's HUD shows while he is too far from the others (the seconds before he is brought back)
 var PlayerController LeashWarned;     // the player who has the leash note now
 var Vector LeashStart;                // the start of the level (the leash's anchor before the first checkpoint)
@@ -310,6 +339,21 @@ event InitGame(string Options, out string Error)
 	LobbyMode = ParseOption(Options, "Lobby");
 	SessionId = ParseOption(Options, "EnhSession");
 	MenuScript = ParseOption(Options, "EnhMenu");
+	// the play test (EnhancedPlayBot): a game started like a player's gets its menu steps from SHREK2_BOT ("menu=...|play=1"), in its first menu only
+	BotText = EnhBotEnv(0);
+	if (MenuScript == "" && IsMenuLevel() && EnhBotEnv(1) != "")
+	{
+		if (InStr(BotText, "menu=") >= 0)
+		{
+			MenuScript = Mid(BotText, InStr(BotText, "menu=") + 5);
+			if (InStr(MenuScript, "|") >= 0)
+			{
+				MenuScript = Left(MenuScript, InStr(MenuScript, "|"));
+			}
+			Log("[PLAY] menu steps from SHREK2_BOT: " $ MenuScript);
+			EnhLog("[PLAY] menu steps from SHREK2_BOT: " $ MenuScript);
+		}
+	}
 	bMenuDump = ParseOption(Options, "EnhMenuDump") != "";
 	bLobbyUpnp = ParseOption(Options, "Upnp") != "";
 	NetTestMode = ParseOption(Options, "EnhNet");
@@ -408,8 +452,15 @@ function bool SetPause(bool bPause, PlayerController P)
 	return false;
 }
 
+native(3546) final function EnhLog(string S);
+
 function T(string S)
 {
+	// the play test is followed in enhnative.log (written at once)
+	if (BotText != "")
+	{
+		EnhLog("[SDBG] " $ MapName() $ " t=" $ string(int(Level.TimeSeconds)) $ " " $ S);
+	}
 	if (Dbg != None)
 	{
 		Dbg.Out("login: " $ S);
@@ -1593,7 +1644,7 @@ function AddGuest(PlayerController PC)
 {
 	GPC[GPC.Length] = PC;
 	GPawn[GPawn.Length] = None;
-	GHidden[GHidden.Length] = false;
+	GHidden[GHidden.Length] = 0;
 	GDead[GDead.Length] = 0.0;
 	GCam[GCam.Length] = None;
 	PendingPC = GPC[0];
@@ -1624,7 +1675,7 @@ function MirrorFirst()
 	{
 		PendingPC = GPC[0];
 		P2Pawn = GPawn[0];
-		bP2Hidden = GHidden[0];
+		bP2Hidden = GHidden[0] != 0;
 	}
 }
 
@@ -1632,7 +1683,7 @@ function SelectGuest(int i)
 {
 	PendingPC = GPC[i];
 	P2Pawn = GPawn[i];
-	bP2Hidden = GHidden[i];
+	bP2Hidden = GHidden[i] != 0;
 	P2DeadSince = GDead[i];
 	CutCam = GCam[i];
 }
@@ -1640,7 +1691,11 @@ function SelectGuest(int i)
 function StoreGuest(int i)
 {
 	GPawn[i] = P2Pawn;
-	GHidden[i] = bP2Hidden;
+	GHidden[i] = 0;
+	if (bP2Hidden)
+	{
+		GHidden[i] = 1;
+	}
 	GDead[i] = P2DeadSince;
 	GCam[i] = CutCam;
 }
@@ -1788,6 +1843,8 @@ event PlayerController Login(string Portal, string Options, out string Error)
 }
 
 // ---- The lobby (front-end level) ----
+
+native(3545) final function string EnhBotEnv(int Once);
 
 function bool IsMenuLevel()
 {
@@ -3683,11 +3740,13 @@ function GotoTick()
 		}
 		if (PC.Pawn != None && PC.Pawn.Physics == PHYS_Projectile && !Class'Enhanced.EnhancedPlayerController'.static.InClimb(PC.Pawn) && !PC.Pawn.IsInState('MountHanging'))
 		{
-			if (PC.ClimbPhysSince == 0.0)
+			// a lily pad's or a bounce pad's throw has this physics too: only a hero that stays put with it is stuck (night run n3)
+			if (PC.ClimbPhysSince == 0.0 || VSize(PC.Pawn.Location - PC.ClimbPhysLoc) > 4.0)
 			{
 				PC.ClimbPhysSince = Level.TimeSeconds;
+				PC.ClimbPhysLoc = PC.Pawn.Location;
 			}
-			else if (Level.TimeSeconds - PC.ClimbPhysSince > 0.4)
+			else if (Level.TimeSeconds - PC.ClimbPhysSince > 1.0)
 			{
 				T("climb: " $ PC.PlayerReplicationInfo.PlayerName $ "'s hero kept the climbing physics after the climb at " $ string(PC.Pawn.Location) $ ": it falls again");
 				PC.Pawn.Velocity = vect(0, 0, 0);
@@ -3960,7 +4019,10 @@ function DeathWatch()
 		}
 	}
 	SetDownNotes(n);
-	if (total > 0 && downs == total)
+	// a player with no hero in the world now (the host in his own cutscene has none, a hidden guest) is not down: he comes back and can help.
+	// Night play run h5: the guest was down, the host's cutscene began (his pawn None for it), the host was left out of the count and the level
+	// was loaded again as if everybody were down
+	if (total > 0 && downs == total && total == n)
 	{
 		if (AllDownSince == 0.0)
 		{
@@ -4132,6 +4194,16 @@ function DeathTestTick(float DeltaTime)
 
 function RegisterGate(Actor A)
 {
+	local string E;
+
+	// a trigger whose event ends in _OFF (or has none) plays no cutscene: the level's switched-off scenes have no script (KWGame.CutFactory makes
+	// none for them). Nothing to wait for: the night play run h2 held both players 90 s at the Hunt's Cut_Hunt_ExplosiveMush_OFF
+	E = Caps(string(A.Event));
+	if (E == "" || E == "NONE" || Right(E, 4) == "_OFF")
+	{
+		T("gate skipped (its event plays no cutscene): " $ string(A) $ " event " $ string(A.Event));
+		return;
+	}
 	GateT[GateT.Length] = A;
 	T("gate registered: " $ string(A) $ " at " $ string(A.Location) $ " event " $ string(A.Event) $ " radius " $ string(int(A.CollisionRadius)));
 }
@@ -4316,6 +4388,10 @@ function GateTick(float DeltaTime)
 				if (PC != None && PC.Pawn != None && HasEntry(PassCtl, PassGate, g, C))
 				{
 					SetGateNote(PC, Localize("Lobby", "GateWait", "Enhanced"));
+					if (EnhancedPlayerController(PC) == None)
+					{
+						GateWaitAt = GateT[g].Location;
+					}
 					D = PC.Pawn.Location - GateT[g].Location;
 					D.Z = 0.0;
 					if (VSize(D) > GateLeash)
@@ -4999,6 +5075,8 @@ function Poll()
 	HeroTweaks();
 	SaveTestTick();
 	SyncGuestHud();
+	GuestHangTick();
+	GuestCamTick();
 	EnsureAnimSync();
 	IdleWatch();
 	WatchCutscenes();
@@ -5015,6 +5093,511 @@ function Poll()
 		if (AllPassed())
 		{
 			FinishCheckpoint("the last player arrived");
+		}
+	}
+}
+
+// The level's camera triggers set only the host's camera (they reach "the" hero's controller through Level.PlayerHeroActor, and a guest's is not a
+// KWHeroController: "Main player's controller isn't a kwHeroController" in the log). Ten times a second: the trigger each guest's hero stands in;
+// stepping in sends its values to the guest (EnhancedPlayerController.ClientCamTrigger), stepping out sends "back to the usual camera" when the
+// trigger does that (bSetToKWDefaultsOnUntouch), as the stock CameraTrigger.Activate/Deactivate do for the host.
+function GuestCamTick()
+{
+	local Actor A, Trg;
+	local EnhancedPlayerController E;
+	local Pawn P;
+	local int i, j;
+
+	if (Level.TimeSeconds - CamTrigAt < 0.1 && Level.TimeSeconds >= CamTrigAt)
+	{
+		return;
+	}
+	CamTrigAt = Level.TimeSeconds;
+	if (!bCamTrigsRead)
+	{
+		bCamTrigsRead = true;
+		foreach AllActors(Class'Engine.Actor', A)
+		{
+			if (A.IsA('CameraTrigger'))
+			{
+				CamTrigs[CamTrigs.Length] = A;
+			}
+		}
+		if (CamTrigs.Length > 0)
+		{
+			T("camera triggers on this level: " $ string(CamTrigs.Length) $ " (guests get their values)");
+		}
+	}
+	if (CamTrigs.Length == 0)
+	{
+		return;
+	}
+	CamTest();
+	for (i = 0; i < GPC.Length; i++)
+	{
+		E = EnhancedPlayerController(GPC[i]);
+		if (E == None)
+		{
+			continue;
+		}
+		P = E.Pawn;
+		Trg = None;
+		if (P != None && !P.bHidden)
+		{
+			for (j = 0; j < CamTrigs.Length; j++)
+			{
+				A = CamTrigs[j];
+				if (A != None && A.bCollideActors && VSize((A.Location - P.Location) * vect(1, 1, 0)) <= A.CollisionRadius + P.CollisionRadius
+					&& Abs(A.Location.Z - P.Location.Z) <= A.CollisionHeight + P.CollisionHeight)
+				{
+					Trg = A;
+					break;
+				}
+			}
+		}
+		if (Trg == E.SrvCamTrig)
+		{
+			continue;
+		}
+		if (E.SrvCamTrig != None && E.SrvCamTrig.GetPropertyText("bSetToKWDefaultsOnUntouch") ~= "True")
+		{
+			T(string(E.SrvCamTrig.Name) $ " no longer holds the camera of " $ string(E) $ ": the usual camera");
+			E.ClientCamTrigger(1, 0.0, vect(0, 0, 0), 0.0, 0.0, 0);
+		}
+		E.SrvCamTrig = Trg;
+		if (Trg == None)
+		{
+			continue;
+		}
+		if (Trg.GetPropertyText("_bSetToKWPawnDefaults") ~= "True")
+		{
+			T(string(Trg.Name) $ " puts the camera of " $ string(E) $ " back to the usual one");
+			E.ClientCamTrigger(1, 0.0, vect(0, 0, 0), 0.0, 0.0, 0);
+			continue;
+		}
+		T(string(Trg.Name) $ " holds the camera of " $ string(E) $ ": distance " $ Trg.GetPropertyText("fLookAtDistance") $ ", offset "
+			$ Trg.GetPropertyText("vLookAtOffset") $ ", pitch " $ Trg.GetPropertyText("fMinPitch") $ ".." $ Trg.GetPropertyText("fMaxPitch") $ ", set pitch "
+			$ Trg.GetPropertyText("PlayerCamPitch"));
+		E.ClientCamTrigger(0, float(Trg.GetPropertyText("fLookAtDistance")), PropVec(Trg.GetPropertyText("vLookAtOffset")),
+			float(Trg.GetPropertyText("fMinPitch")), float(Trg.GetPropertyText("fMaxPitch")), int(Trg.GetPropertyText("PlayerCamPitch")));
+	}
+}
+
+// Tests only (the server's SHREK2_BOT has camtest=1): every 20 s the first guest's hero is put into the next camera trigger of the level, then next to
+// the host's hero, and so on; the guest's machine takes its own shots of what its camera shows (camshot=1 there, EnhancedPlayerController).
+function CamTest()
+{
+	local Actor A;
+	local Pawn P;
+	local Vector L;
+
+	if (!bCamTestRead)
+	{
+		bCamTestRead = true;
+		bCamTest = InStr(EnhBotEnv(0), "camtest=1") >= 0;
+		CamTestNext = Level.TimeSeconds + 20.0;
+	}
+	if (!bCamTest || GPC.Length == 0 || GPC[0] == None || GPC[0].Pawn == None || GPC[0].Pawn.bHidden || Level.TimeSeconds < CamTestNext)
+	{
+		return;
+	}
+	CamTestNext = Level.TimeSeconds + 20.0;
+	P = GPC[0].Pawn;
+	if ((CamTestStep & 1) == 0)
+	{
+		A = CamTrigs[(CamTestStep / 2) % CamTrigs.Length];
+		L = A.Location;
+		T("camera test: the guest's hero is put into " $ string(A.Name) $ " at " $ string(L) $ " (radius " $ string(int(A.CollisionRadius)) $ ", height "
+			$ string(int(A.CollisionHeight)) $ ")");
+	}
+	else
+	{
+		if (HostController() == None || HostController().Pawn == None)
+		{
+			return;
+		}
+		L = HostController().Pawn.Location + vect(0, 0, 40);
+		T("camera test: the guest's hero is put next to the host's");
+	}
+	CamTestStep++;
+	if (!P.SetLocation(L))
+	{
+		P.SetLocation(L + vect(0, 0, 60));
+	}
+	P.Velocity = vect(0, 0, 0);
+	P.SetPhysics(PHYS_Falling);
+	GPC[0].ClientSetLocation(P.Location, P.Rotation);
+}
+
+// ---- Lift gates ----
+
+// the level's lifts (see LiftT): a touch trigger that stands on the mover its event moves, or a mover that starts when stood on
+function ReadLifts()
+{
+	local Actor A, M, Hit;
+	local Vector HL, HN;
+
+	bLiftsRead = true;
+	foreach AllActors(Class'Engine.Actor', A)
+	{
+		if (A.IsA('Mover') && A.IsInState('StandOpenTimed'))
+		{
+			AddLift(A, 2, A);
+			continue;
+		}
+		if (!(A.IsA('ElevatorTrigger') || (A.IsA('Trigger') && !A.IsA('CutSceneTrigger') && !A.IsA('CameraTrigger'))))
+		{
+			continue;
+		}
+		if (A.Event == '' || A.Event == 'None')
+		{
+			continue;
+		}
+		foreach AllActors(Class'Engine.Actor', M, A.Event)
+		{
+			if (!M.IsA('Mover'))
+			{
+				continue;
+			}
+			// the trigger stands on that mover: the first thing under it is the mover itself
+			Hit = Trace(HL, HN, A.Location - vect(0, 0, 1) * (A.CollisionHeight + 160.0), A.Location + vect(0, 0, 20), true);
+			if (Hit == M && A.bCollideActors)
+			{
+				AddLift(A, 1, M);
+				break;
+			}
+			T("not a lift gate: " $ string(A.Name) $ " moves " $ string(M.Name) $ " (touchable " $ string(A.bCollideActors) $ ", under it " $ string(Hit) $ ")");
+		}
+	}
+	T("lift gates on this level: " $ string(LiftT.Length));
+}
+
+function AddLift(Actor A, byte Kind, Actor M)
+{
+	local int k;
+
+	k = LiftT.Length;
+	LiftT[k] = A;
+	LiftKind[k] = Kind;
+	LiftMover[k] = M;
+	LiftLatch[k] = 0;
+	LiftDone[k] = 0;
+	LiftSince[k] = 0.0;
+	LiftWentAt[k] = 0.0;
+	T("lift gate " $ string(k) $ ": " $ string(A.Name) $ " (kind " $ string(Kind) $ ") moves " $ string(M.Name) $ " at " $ string(A.Location) $ ", radius "
+		$ string(int(A.CollisionRadius)) $ ", once " $ A.GetPropertyText("bTriggerOnceOnly"));
+}
+
+// is the pawn on lift k: inside the trigger's volume (kind 1), or standing on the mover (kind 2)
+function bool OnLift(int k, Pawn P)
+{
+	if (P == None || P.bHidden)
+	{
+		return false;
+	}
+	if (LiftKind[k] == 2)
+	{
+		return P.Base == LiftMover[k];
+	}
+	return InGateZone(LiftT[k], P);
+}
+
+// own triggering of the lifts held while a guest plays, given back when the host plays alone again
+function HoldLifts(bool bHold)
+{
+	local int k;
+
+	if (bHold == bLiftsHeld)
+	{
+		return;
+	}
+	bLiftsHeld = bHold;
+	for (k = 0; k < LiftT.Length; k++)
+	{
+		if (LiftT[k] == None || LiftDone[k] != 0)
+		{
+			continue;
+		}
+		if (LiftKind[k] == 2)
+		{
+			if (bHold)
+			{
+				LiftMover[k].GotoState('TriggerOpenTimed');
+			}
+			else
+			{
+				LiftMover[k].GotoState('StandOpenTimed');
+			}
+		}
+		else
+		{
+			LiftT[k].SetCollision(!bHold, false, false);
+		}
+	}
+	if (bHold)
+	{
+		T("lift gates: " $ string(LiftT.Length) $ " wait for every player");
+	}
+	else
+	{
+		T("lift gates: " $ string(LiftT.Length) $ " work as in the stock game again");
+	}
+}
+
+// Every frame (EnhancedTicker): a lift goes when every player stands on it, or 90 s (GateTimeout) after the first stepped on.
+function LiftTick(float DeltaTime)
+{
+	local int k, nOn, nAll;
+	local Controller C;
+	local PlayerController PC;
+	local Pawn First;
+
+	if (IsMenuLevel() || IsCutsceneLevel() || Level.NetMode != NM_ListenServer)
+	{
+		return;
+	}
+	if (!bLiftsRead)
+	{
+		ReadLifts();
+	}
+	if (LiftT.Length == 0)
+	{
+		return;
+	}
+	HoldLifts(GPC.Length > 0);
+	if (!bLiftsHeld)
+	{
+		return;
+	}
+	LiftTest();
+	for (k = 0; k < LiftT.Length; k++)
+	{
+		if (LiftWentAt[k] > 0.0 && Level.TimeSeconds - LiftWentAt[k] > 2.0 && LiftMover[k] != None)
+		{
+			LiftWentAt[k] = 0.0;
+			T("lift gate " $ string(k) $ " (" $ string(LiftT[k].Name) $ "): its mover " $ string(LiftMover[k].Name) $ " moved "
+				$ string(int(VSize(LiftMover[k].Location - LiftWentFrom[k]))) $ " units in 2 s");
+		}
+		if (LiftT[k] == None || LiftT[k].bDeleteMe || LiftDone[k] != 0)
+		{
+			continue;
+		}
+		// a level event may give the trigger its collision back: it must not go by itself
+		if (LiftKind[k] == 1 && LiftT[k].bCollideActors)
+		{
+			LiftT[k].SetCollision(false, false, false);
+		}
+		nOn = 0;
+		nAll = 0;
+		First = None;
+		for (C = Level.ControllerList; C != None; C = C.NextController)
+		{
+			PC = PlayerController(C);
+			if (PC == None)
+			{
+				continue;
+			}
+			nAll++;
+			if (OnLift(k, PC.Pawn))
+			{
+				nOn++;
+				if (First == None)
+				{
+					First = PC.Pawn;
+				}
+			}
+		}
+		if (LiftLatch[k] != 0)
+		{
+			// it went: again only after everybody stepped off (a trigger that holds its mover while stood on lets it go now)
+			if (nOn == 0)
+			{
+				LiftLatch[k] = 0;
+				if (LiftKind[k] == 1 && LiftMover[k] != None && LiftMover[k].IsInState('TriggerControl') && HostController() != None
+					&& HostController().Pawn != None)
+				{
+					LiftT[k].UnTouch(HostController().Pawn);
+				}
+			}
+			continue;
+		}
+		if (nOn == 0)
+		{
+			if (LiftSince[k] > 0.0)
+			{
+				LiftSince[k] = 0.0;
+				SetGateNote(None, "");
+			}
+			continue;
+		}
+		if (LiftSince[k] == 0.0)
+		{
+			LiftSince[k] = Level.TimeSeconds;
+			T("lift gate " $ string(k) $ " (" $ string(LiftT[k].Name) $ "): " $ string(nOn) $ " of " $ string(nAll) $ " players on it, it waits for the others");
+		}
+		if (nOn < nAll && !(GateTimeout > 0.0 && Level.TimeSeconds - LiftSince[k] > GateTimeout))
+		{
+			for (C = Level.ControllerList; C != None; C = C.NextController)
+			{
+				PC = PlayerController(C);
+				if (PC != None && OnLift(k, PC.Pawn))
+				{
+					SetGateNote(PC, Localize("Lobby", "GateWait", "Enhanced"));
+					if (EnhancedPlayerController(PC) == None)
+					{
+						GateWaitAt = LiftT[k].Location;
+					}
+				}
+			}
+			continue;
+		}
+		if (nOn < nAll)
+		{
+			T("lift gate " $ string(k) $ " (" $ string(LiftT[k].Name) $ "): the others did not come in " $ string(int(GateTimeout)) $ " s, it goes with " $ string(nOn));
+		}
+		else
+		{
+			T("lift gate " $ string(k) $ " (" $ string(LiftT[k].Name) $ "): every player is on it, it goes");
+		}
+		SetGateNote(None, "");
+		LiftSince[k] = 0.0;
+		LiftLatch[k] = 1;
+		LiftWentAt[k] = Level.TimeSeconds;
+		LiftWentFrom[k] = LiftMover[k].Location;
+		if (LiftKind[k] == 2)
+		{
+			LiftMover[k].Trigger(First, First);
+		}
+		else
+		{
+			LiftT[k].Touch(First);
+			if (LiftT[k].GetPropertyText("bTriggerOnceOnly") ~= "True")
+			{
+				LiftDone[k] = 1;
+			}
+		}
+	}
+}
+
+// Tests only (the server's SHREK2_BOT has lifttest=1): for each lift in turn the host's hero is put on it (it must wait), 8 s later the first
+// guest's (it must go), 8 s later both are put back where they were.
+function LiftTest()
+{
+	local Pawn H, G;
+	local Vector L;
+
+	if (!bLiftTestRead)
+	{
+		bLiftTestRead = true;
+		bLiftTest = InStr(EnhBotEnv(0), "lifttest=1") >= 0;
+		LiftTestNext = Level.TimeSeconds + 25.0;
+	}
+	if (!bLiftTest || Level.TimeSeconds < LiftTestNext || GPC.Length == 0 || GPC[0] == None || HostController() == None)
+	{
+		return;
+	}
+	H = HostController().Pawn;
+	G = GPC[0].Pawn;
+	if (H == None || G == None || H.bHidden || G.bHidden || LiftTestAt >= LiftT.Length)
+	{
+		return;
+	}
+	LiftTestNext = Level.TimeSeconds + 8.0;
+	L = LiftT[LiftTestAt].Location;
+	if (LiftKind[LiftTestAt] == 2)
+	{
+		L = LiftMover[LiftTestAt].Location + vect(0, 0, 120);
+	}
+	if (LiftTestPhase == 0)
+	{
+		LiftTestHostWas = H.Location;
+		LiftTestGuestWas = G.Location;
+		T("lift test " $ string(LiftTestAt) $ ": the host's hero is put on " $ string(LiftT[LiftTestAt].Name));
+		PutPawn(None, H, L);
+	}
+	else if (LiftTestPhase == 1)
+	{
+		T("lift test " $ string(LiftTestAt) $ ": the guest's hero is put on " $ string(LiftT[LiftTestAt].Name) $ " too");
+		PutPawn(GPC[0], G, L + vect(30, 30, 0));
+	}
+	else
+	{
+		T("lift test " $ string(LiftTestAt) $ ": both heroes put back");
+		PutPawn(None, H, LiftTestHostWas);
+		PutPawn(GPC[0], G, LiftTestGuestWas);
+		LiftTestAt++;
+	}
+	LiftTestPhase = (LiftTestPhase + 1) % 3;
+}
+
+function PutPawn(PlayerController PC, Pawn P, Vector L)
+{
+	if (!P.SetLocation(L))
+	{
+		P.SetLocation(L + vect(0, 0, 60));
+	}
+	P.Velocity = vect(0, 0, 0);
+	P.SetPhysics(PHYS_Falling);
+	if (PC != None)
+	{
+		PC.ClientSetLocation(P.Location, P.Rotation);
+	}
+}
+
+// "(X=1.000000,Y=2.000000,Z=3.000000)" (GetPropertyText of a vector) as a vector
+static function Vector PropVec(string S)
+{
+	local Vector V;
+	local int i;
+
+	i = InStr(S, "X=");
+	if (i >= 0)
+	{
+		V.X = float(Mid(S, i + 2));
+	}
+	i = InStr(S, "Y=");
+	if (i >= 0)
+	{
+		V.Y = float(Mid(S, i + 2));
+	}
+	i = InStr(S, "Z=");
+	if (i >= 0)
+	{
+		V.Z = float(Mid(S, i + 2));
+	}
+	return V;
+}
+
+// A guest's hero hangs (a vine, a ledge: KWPawn state MountHanging) only here on the server, where his hero is run; that state is not simulated, so
+// his own machine never knows it. The flag goes to his controller (bHangSrv, replicated to its owner) for his play bot.
+function GuestHangTick()
+{
+	local int i;
+	local EnhancedPlayerController E;
+	local bool b;
+	local float Dt;
+
+	Dt = Level.TimeSeconds - HangTickAt;
+	HangTickAt = Level.TimeSeconds;
+	if (Dt < 0.0 || Dt > 0.5)
+	{
+		Dt = 0.0;
+	}
+	for (i = 0; i < GPC.Length; i++)
+	{
+		E = EnhancedPlayerController(GPC[i]);
+		if (E == None)
+		{
+			continue;
+		}
+		if (E.AnimWatch(E.Pawn, Dt, "server") && E.AnimFixes <= 5)
+		{
+			EnhLog("[ANIM] " $ MapName() $ " server: the movement animation of " $ string(E.Pawn) $ " was off outside a climb, switched on again (T pose watch)");
+		}
+		b = E.Pawn != None && E.Pawn.IsInState('MountHanging');
+		if (E.bHangSrv != b)
+		{
+			E.bHangSrv = b;
 		}
 	}
 }
@@ -5810,6 +6393,12 @@ function SpawnSecond(PlayerController Host)
 // During a cutscene player two's Shrek is hidden and held still (the cutscene scripts know only one Shrek).
 function HideSecond(PlayerController Host)
 {
+	if (HideLogs < 6)
+	{
+		HideLogs++;
+		T("hide: guest " $ string(PendingPC) $ " pawn " $ string(P2Pawn) $ " flag " $ string(bP2Hidden) $ " guests " $ string(GPC.Length) $ " cut " $ string(CutSerial)
+			$ " opening " $ string(OpeningSerial) $ " pawn hidden " $ string(P2Pawn.bHidden));
+	}
 	P2Pawn.bHidden = true;
 	P2Pawn.SetCollision(false, false, false);
 	P2Pawn.SetPhysics(PHYS_None);
@@ -6031,6 +6620,14 @@ function ManageOne()
 	}
 	else if (bP2Hidden && !GuestInOwnCut() && (bFree || GuestDoneOwnCut()))
 	{
+		ShowSecond(Host);
+	}
+	else if (bFree && !bP2Hidden && !GuestInOwnCut() && P2Pawn.bHidden)
+	{
+		// the host is free and the guest's hero is still hidden though nothing says so (night play run h2, the Hunt's pumpkins cutscene: the hide
+		// was made over and over during the cutscene, the show never came, the guest's Donkey stayed hidden, still and without collision with his
+		// camera on the host's hero): shown again
+		T("cutscene over: the Shrek of player two was left hidden (bP2Hidden false), shown again");
 		ShowSecond(Host);
 	}
 }
